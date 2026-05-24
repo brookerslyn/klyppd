@@ -22,18 +22,17 @@ jobs:
       - run: npm ci
 
       - name: Build
-        run: npm run electron:build
+        run: npm run electron:build -- --publish never
 
       - name: Collect artifacts
         run: |
-          mkdir -p dist
-          cp release/*.deb dist/ 2>/dev/null || true
-          cp release/*.AppImage dist/ 2>/dev/null || true
-          cp release/*.rpm dist/ 2>/dev/null || true
-          ls dist/
+          ls dist/*.deb dist/*.AppImage dist/*.rpm 2>/dev/null || true
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            dist/*.deb
+            dist/*.AppImage
+            dist/*.rpm
           generate_release_notes: true
