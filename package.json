@@ -49,6 +49,9 @@
       "dist-electron/**/*",
       "public/**/*"
     ],
+    "asarUnpack": [
+      "dist-electron/preload.cjs"
+    ],
     "extraMetadata": {
       "main": "dist-electron/main.js"
     }

@@ -683,7 +683,7 @@ function createWindow(): void {
     transparent: false,
     backgroundColor: "#101418",
     webPreferences: {
-      preload: path.join(__dirname, "preload.cjs"),
+      preload: path.join(__dirname, "preload.cjs").replace("app.asar", "app.asar.unpacked"),
       contextIsolation: true,
       nodeIntegration: false,
     },
