@@ -2,6 +2,7 @@
   "name": "klyppd",
   "version": "0.3.0",
   "description": "Medal-style clip manager for Linux — gpu-screen-recorder + Cloudflare R2.",
+  "author": "brookerslyn <brookerslyn@proton.me>",
   "type": "module",
   "main": "dist-electron/main.js",
   "scripts": {
