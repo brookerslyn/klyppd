@@ -60,7 +60,14 @@ fn update_clip_folder(state: tauri::State<AppState>, id: String, folder: String)
 
 #[tauri::command]
 fn delete_clip(state: tauri::State<AppState>, id: String) -> Result<(), String> {
-    state.db.lock().unwrap().delete_clip(&id).map_err(err)
+    let db = state.db.lock().unwrap();
+    if let Ok(clip) = db.get_clip(&id) {
+        std::fs::remove_file(&clip.path).ok();
+        if let Some(thumb) = &clip.thumbnail_path {
+            std::fs::remove_file(thumb).ok();
+        }
+    }
+    db.delete_clip(&id).map_err(err)
 }
 
 #[tauri::command]
@@ -594,6 +601,12 @@ fn spawn_evdev_hotkeys(handle: tauri::AppHandle) {
 
         if devices.is_empty() {
             eprintln!("klyppd: no keyboard found in /dev/input/ (are you in the 'input' group?)");
+            // Notify the user visually — they probably launched from rofi and can't see stderr
+            notify_desktop("Klyppd", "Hotkeys unavailable — add yourself to the 'input' group and relog");
+            let _ = handle.emit("toast", serde_json::json!({
+                "msg": "Hotkeys unavailable — run: sudo usermod -aG input $USER then relog",
+                "kind": "err"
+            }));
             return;
         }
 
