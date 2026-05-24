@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+/build/
+/dist-electron/
+dist-electron/main.js
+dist-electron/main.js.map
+dist-electron/db.js*
+dist-electron/editor.js*
+dist-electron/hotkeys.js*
+dist-electron/r2.js*
+dist-electron/recorder.js*
+dist-electron/settings.js*
+
+# Keep preload.cjs (it's hand-written CJS)
+!dist-electron/preload.cjs
+
+# Rust
+src-tauri/target/
+
+# Electron
+*.asar
+out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# AUR build artifacts
+packaging/aur/*/src/
+packaging/aur/*/pkg/
+packaging/aur/*/*.pkg.tar.*
+packaging/aur/*/*.tar.gz
+packaging/aur/*/*.tar.zst
+packaging/aur/*/*.deb
+packaging/aur/*/klyppd/
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Misc
+*.local

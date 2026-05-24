@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowJs": true,
+    "checkJs": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "strict": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "paths": {
+      "$lib/*": ["./src/lib/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.svelte"]
+}

@@ -1,0 +1,18 @@
+:root {
+  --bg-base: #101418;
+  --bg-deepest: #0b0f12;
+  --bg-elev-1: #181c20;
+  --bg-elev-2: #1c2024;
+  --text: #e0e2e8;
+  --text-dim: #c2c7cf;
+  --text-muted: #8c9198;
+  --text-faint: #42474e;
+  --border: #1c2024;
+  --border-strong: #36393e;
+  --accent: #9accfa;
+  --danger: #ffb4ab;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'IBM Plex Mono', ui-monospace, monospace;
+  --font-size: 12px;
+  --bg-opacity: 1.0;
+  --blur-radius: 0px;
+}

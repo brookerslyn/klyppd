@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Klyppd
+GenericName=Clip Manager
+Comment=Medal-style clip manager and screen recorder
+Exec=klyppd %U
+Icon=klyppd
+Terminal=false
+Categories=AudioVideo;Recorder;Utility;
+Keywords=clip;record;screen;capture;replay;medal;
+StartupNotify=true
+StartupWMClass=klyppd
