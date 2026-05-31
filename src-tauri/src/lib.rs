@@ -4,11 +4,13 @@ mod r2;
 mod recorder;
 mod settings;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use base64::Engine;
 use chrono::{Duration, Local, Utc};
+use serde::Serialize;
 use serde_json::json;
 use tauri::{Emitter, Manager};
 
@@ -16,17 +18,22 @@ use db::{Clip, Database};
 use recorder::{Recorder, RecordingState};
 use settings::AppSettings;
 
-const SOCKET_PATH: &str = "/tmp/klyppd.sock";
 const PENDING_NAME_PATH: &str = "/tmp/klyppd-pending-name";
+const PENDING_AUDIO_TRACKS_PATH: &str = "/tmp/klyppd-pending-audio-tracks";
 const PREVIEW_DIR: &str = "klyppd-preview";
 
-// TODO: move socket to XDG_RUNTIME_DIR instead of /tmp (multi-user conflict)
 // TODO: configurable preview cache limit (currently grows unbounded)
 
 pub struct AppState {
     pub db: Mutex<Database>,
     pub recorder: Mutex<Recorder>,
     pub settings: Mutex<AppSettings>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AudioDeviceOption {
+    value: String,
+    label: String,
 }
 
 fn err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
@@ -59,6 +66,11 @@ fn update_clip_folder(state: tauri::State<AppState>, id: String, folder: String)
 }
 
 #[tauri::command]
+fn update_clip_favorite(state: tauri::State<AppState>, id: String, favorite: bool) -> Result<(), String> {
+    state.db.lock().unwrap().update_clip_favorite(&id, favorite).map_err(err)
+}
+
+#[tauri::command]
 fn delete_clip(state: tauri::State<AppState>, id: String) -> Result<(), String> {
     let db = state.db.lock().unwrap();
     if let Ok(clip) = db.get_clip(&id) {
@@ -66,6 +78,7 @@ fn delete_clip(state: tauri::State<AppState>, id: String) -> Result<(), String> 
         if let Some(thumb) = &clip.thumbnail_path {
             std::fs::remove_file(thumb).ok();
         }
+        editor::remove_audio_tracks_sidecar(&clip.path).ok();
     }
     db.delete_clip(&id).map_err(err)
 }
@@ -85,6 +98,7 @@ fn rename_clip(state: tauri::State<AppState>, id: String, new_name: String) -> R
     let new_path = old_path.parent().unwrap_or(Path::new(".")).join(&new_filename);
 
     std::fs::rename(old_path, &new_path).map_err(err)?;
+    editor::rename_audio_tracks_sidecar(&clip.path, &new_path.to_string_lossy()).map_err(err)?;
     db.rename_clip(&id, &new_filename, &new_path.to_string_lossy()).map_err(err)
 }
 
@@ -125,8 +139,14 @@ fn get_recording_state(state: tauri::State<AppState>) -> RecordingState {
 // Editor ----------------------------------------------------------------------
 
 #[tauri::command]
-async fn trim_clip(input: String, output: String, start: f64, end: f64) -> Result<String, String> {
-    editor::trim(&input, &output, start, end).map_err(err)
+async fn trim_clip(
+    input: String,
+    output: String,
+    start: f64,
+    end: f64,
+    enabled_audio_tracks: Option<Vec<usize>>,
+) -> Result<String, String> {
+    editor::trim(&input, &output, start, end, enabled_audio_tracks.as_deref()).map_err(err)
 }
 
 #[tauri::command]
@@ -135,29 +155,45 @@ async fn crop_clip(input: String, output: String, x: u32, y: u32, w: u32, h: u32
 }
 
 #[tauri::command]
-async fn transcode_for_preview(input: String) -> Result<String, String> {
+async fn get_clip_audio_tracks(path: String) -> Vec<editor::ClipAudioTrack> {
+    editor::get_audio_tracks(&path)
+}
+
+#[tauri::command]
+async fn transcode_for_preview(input: String, enabled_audio_tracks: Option<Vec<usize>>) -> Result<String, String> {
     // If it's already mp4 with aac audio, skip entirely — serve the original
-    if input.ends_with(".mp4") && has_aac_audio(&input) {
+    if enabled_audio_tracks.is_none()
+        && input.ends_with(".mp4")
+        && has_aac_audio(&input)
+        && editor::audio_stream_count(&input) <= 1
+    {
         return Ok(input);
     }
 
     let dir = std::env::temp_dir().join(PREVIEW_DIR);
     std::fs::create_dir_all(&dir).map_err(err)?;
     let stem = Path::new(&input).file_stem().unwrap_or_default().to_string_lossy();
-    let out = dir.join(format!("{stem}.mp4"));
+    let track_key = enabled_audio_tracks
+        .as_ref()
+        .map(|tracks| {
+            if tracks.is_empty() {
+                "muted".into()
+            } else {
+                tracks.iter().map(usize::to_string).collect::<Vec<_>>().join("-")
+            }
+        })
+        .unwrap_or_else(|| "all".into());
+    let out = dir.join(format!("{stem}-{track_key}.mp4"));
     if out.exists() {
         return Ok(out.to_string_lossy().into());
     }
 
-    let ok = std::process::Command::new("ffmpeg")
-        .args(["-y", "-i", &input, "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"])
-        .arg(&out)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    if !ok { return Err("ffmpeg transcode failed".into()); }
-    Ok(out.to_string_lossy().into())
+    editor::render_browser_copy(
+        &input,
+        &out.to_string_lossy(),
+        enabled_audio_tracks.as_deref(),
+    )
+    .map_err(err)
 }
 
 fn has_aac_audio(path: &str) -> bool {
@@ -174,6 +210,9 @@ fn has_aac_audio(path: &str) -> bool {
 async fn upload_clip(state: tauri::State<'_, AppState>, id: String, permanent: bool) -> Result<String, String> {
     let s = state.settings.lock().unwrap().clone();
     let clip = state.db.lock().unwrap().get_clip(&id).map_err(err)?;
+    if let Some(url) = clip.r2_url.as_ref() {
+        return Ok(url.clone());
+    }
     let url = r2::upload(&s, &clip, permanent).await.map_err(err)?;
     let expiry = (!permanent).then(|| Utc::now() + Duration::days(s.expiry_days as i64));
     state.db.lock().unwrap().mark_uploaded(&id, &url, permanent, expiry).map_err(err)?;
@@ -222,6 +261,111 @@ fn save_settings(state: tauri::State<AppState>, new_settings: AppSettings) -> Re
 }
 
 #[tauri::command]
+fn list_audio_input_devices() -> Result<Vec<AudioDeviceOption>, String> {
+    let output = std::process::Command::new("gpu-screen-recorder")
+        .arg("--list-audio-devices")
+        .output()
+        .map_err(err)?;
+
+    let mut devices = Vec::new();
+    let mut seen = HashSet::new();
+    push_audio_device(
+        &mut devices,
+        &mut seen,
+        "default_input",
+        "Default input",
+    );
+
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    for line in text.lines() {
+        if let Some(device) = parse_audio_input_line(line) {
+            let label = device.label.clone();
+            push_audio_device(&mut devices, &mut seen, &device.value, &label);
+        }
+    }
+
+    Ok(devices)
+}
+
+fn parse_audio_input_line(line: &str) -> Option<AudioDeviceOption> {
+    let line = line.trim();
+    if line.is_empty()
+        || line.starts_with("gsr ")
+        || line.starts_with("usage:")
+        || line.starts_with("Run ")
+        || line.starts_with("Audio ")
+        || line.starts_with("NOTES:")
+        || line.starts_with("expected one of:")
+    {
+        return None;
+    }
+
+    let (value, raw_label, structured) = if let Some((value, label)) = line.split_once('|') {
+        (value.trim(), label.trim(), true)
+    } else {
+        let value = line.split_whitespace().next()?.trim();
+        (value, line[value.len()..].trim(), false)
+    };
+    let label = raw_label
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(raw_label)
+        .trim();
+
+    if !is_audio_input_value(value, label, structured) {
+        return None;
+    }
+
+    Some(AudioDeviceOption {
+        value: value.into(),
+        label: if label.is_empty() { value.into() } else { label.into() },
+    })
+}
+
+fn is_audio_input_value(value: &str, label: &str, structured: bool) -> bool {
+    let label = label.to_lowercase();
+    if value == "default_input" || value.starts_with("alsa_input.") {
+        return true;
+    }
+    if value.is_empty()
+        || value == "default_output"
+        || value.starts_with("alsa_output.")
+        || value.ends_with(".monitor")
+        || label.starts_with("monitor of")
+    {
+        return false;
+    }
+    if structured {
+        return true;
+    }
+
+    let value = value.to_lowercase();
+    let source_shaped = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'));
+    source_shaped && (value.contains("input") || value.contains("mic") || value.contains("source"))
+}
+
+fn push_audio_device(
+    devices: &mut Vec<AudioDeviceOption>,
+    seen: &mut HashSet<String>,
+    value: &str,
+    label: &str,
+) {
+    if seen.insert(value.to_string()) {
+        devices.push(AudioDeviceOption {
+            value: value.into(),
+            label: label.into(),
+        });
+    }
+}
+
+#[tauri::command]
 fn get_storage_usage(state: tauri::State<AppState>) -> Result<u64, String> {
     let dir = state.settings.lock().unwrap().clips_directory.clone();
     Ok(std::fs::read_dir(&dir).map(|entries| {
@@ -235,6 +379,13 @@ fn get_storage_usage(state: tauri::State<AppState>) -> Result<u64, String> {
 fn get_theme_css() -> Result<String, String> {
     let path = config_dir().join("theme.css");
     Ok(std::fs::read_to_string(path).unwrap_or_default())
+}
+
+#[tauri::command]
+fn save_theme_css(css: String) -> Result<(), String> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    std::fs::write(dir.join("theme.css"), css).map_err(err)
 }
 
 // Files -----------------------------------------------------------------------
@@ -352,12 +503,14 @@ fn scan_clips(state: tauri::State<AppState>) -> Result<Vec<Clip>, String> {
             let clip = Clip {
                 id: uuid::Uuid::new_v4().to_string(),
                 filename: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                window_name: None,
                 path: path_str,
                 duration: editor::get_duration(&path.to_string_lossy()).unwrap_or(0.0),
                 created_at: created,
                 thumbnail_path: thumb_path,
                 tags: None,
                 folder: None,
+                favorite: false,
                 upload_status: "local".into(),
                 r2_key: None,
                 r2_url: None,
@@ -375,6 +528,14 @@ fn scan_clips(state: tauri::State<AppState>) -> Result<Vec<Clip>, String> {
 
 fn config_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_default().join("klyppd")
+}
+
+fn socket_path() -> PathBuf {
+    dirs::runtime_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("klyppd")
+        .join("klyppd.sock")
 }
 
 fn capture_window_class() -> String {
@@ -488,13 +649,22 @@ fn handle_hotkey(handle: &tauri::AppHandle, cmd: &str) {
             let date = Local::now().format("%Y-%m-%d").to_string();
             std::fs::write(PENDING_NAME_PATH, format!("{win}_{date}")).ok();
 
-            match state.recorder.lock().unwrap().save_replay() {
+            let mut recorder = state.recorder.lock().unwrap();
+            let tracks = recorder.replay_tracks();
+            if !tracks.is_empty() {
+                serde_json::to_vec_pretty(&tracks)
+                    .ok()
+                    .and_then(|bytes| std::fs::write(PENDING_AUDIO_TRACKS_PATH, bytes).ok());
+            }
+
+            match recorder.save_replay() {
                 Ok(_) => {
                     let body = format!("Klyppd the last {}s of {}", settings.buffer_seconds, win);
                     toast(handle, &body, "ok");
                     notify_desktop("Klypp saved", &body);
                 }
                 Err(_) => {
+                    std::fs::remove_file(PENDING_AUDIO_TRACKS_PATH).ok();
                     toast(handle, "Buffer not running", "err");
                     notify_desktop("Klyppd", "Buffer not running");
                 }
@@ -708,8 +878,12 @@ fn spawn_socket_listener(handle: tauri::AppHandle) {
     use std::os::unix::net::UnixListener;
 
     std::thread::spawn(move || {
-        let _ = std::fs::remove_file(SOCKET_PATH);
-        let Ok(listener) = UnixListener::bind(SOCKET_PATH) else { return; };
+        let path = socket_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&path);
+        let Ok(listener) = UnixListener::bind(&path) else { return; };
 
         for stream in listener.incoming().flatten() {
             let mut s = stream;
@@ -749,6 +923,7 @@ fn spawn_clips_watcher(handle: tauri::AppHandle, dir: String) {
                 std::thread::sleep(StdDuration::from_millis(1200));
 
                 let final_path = rename_if_pending(&path, ext).unwrap_or(path);
+                write_pending_audio_tracks(&final_path);
                 let filename = final_path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 let _ = handle.emit("clip-saved", json!({
                     "filename": filename,
@@ -775,6 +950,82 @@ fn rename_if_pending(path: &Path, ext: &str) -> Option<PathBuf> {
     let result = std::fs::rename(path, &target).ok().map(|_| target);
     std::fs::remove_file(PENDING_NAME_PATH).ok();
     result
+}
+
+fn write_pending_audio_tracks(path: &Path) {
+    let Ok(bytes) = std::fs::read(PENDING_AUDIO_TRACKS_PATH) else { return; };
+    let Ok(tracks) = serde_json::from_slice::<Vec<editor::AudioTrackMeta>>(&bytes) else {
+        std::fs::remove_file(PENDING_AUDIO_TRACKS_PATH).ok();
+        return;
+    };
+
+    editor::write_audio_tracks_sidecar(&path.to_string_lossy(), &tracks).ok();
+    std::fs::remove_file(PENDING_AUDIO_TRACKS_PATH).ok();
+}
+
+pub fn purge_non_temp_r2() -> Result<(usize, usize), String> {
+    let settings = settings::load().map_err(err)?;
+    let data_dir = dirs::data_dir().unwrap_or_default().join("klyppd");
+    std::fs::create_dir_all(&data_dir).map_err(err)?;
+    let db = Database::new(&data_dir.join("clips.db")).map_err(err)?;
+    let clips = db.get_uploaded_clips(true).map_err(err)?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(err)?;
+
+    let mut deleted = 0usize;
+    let mut failed = 0usize;
+    for clip in clips {
+        let Some(key) = clip.r2_key.as_deref() else {
+            failed += 1;
+            continue;
+        };
+        let removed = rt.block_on(r2::delete(&settings, key)).is_ok();
+        if removed && db.mark_deleted(&clip.id).is_ok() {
+            deleted += 1;
+        } else {
+            failed += 1;
+        }
+    }
+
+    let (extra_deleted, extra_failed) = rt
+        .block_on(r2::purge_non_temp_objects(&settings))
+        .map_err(err)?;
+    deleted += extra_deleted;
+    failed += extra_failed;
+
+    Ok((deleted, failed))
+}
+
+pub fn purge_orphan_temp_r2() -> Result<(usize, usize), String> {
+    let settings = settings::load().map_err(err)?;
+    let data_dir = dirs::data_dir().unwrap_or_default().join("klyppd");
+    std::fs::create_dir_all(&data_dir).map_err(err)?;
+    let db = Database::new(&data_dir.join("clips.db")).map_err(err)?;
+    let clips = db.get_uploaded_clips(false).map_err(err)?;
+
+    let keep: HashSet<String> = clips
+        .into_iter()
+        .filter_map(|clip| clip.r2_key)
+        .map(|k| {
+            let k = k.strip_suffix(".html").unwrap_or(&k);
+            let k = k.strip_suffix(".mp4").unwrap_or(k);
+            let k = k.strip_suffix(".mkv").unwrap_or(k);
+            let k = k.strip_suffix(".webm").unwrap_or(k);
+            let k = k.strip_suffix(".jpg").unwrap_or(k);
+            k.to_string()
+        })
+        .collect();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(err)?;
+
+    rt.block_on(r2::purge_orphan_temp_objects(&settings, &keep))
+        .map_err(err)
 }
 
 // Entry point ----------------------------------------------------------------
@@ -817,12 +1068,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_clips, get_clips_by_folder, get_uploaded_clips,
-            update_clip_tags, update_clip_folder, delete_clip, rename_clip,
+            update_clip_tags, update_clip_folder, update_clip_favorite, delete_clip, rename_clip,
             start_replay_buffer, stop_replay_buffer, save_replay,
             start_recording, stop_recording, get_recording_state,
             trim_clip, crop_clip, transcode_for_preview,
+            get_clip_audio_tracks,
             upload_clip, delete_from_r2, r2_storage,
             get_settings, save_settings, set_window_opacity, get_storage_usage, get_theme_css,
+            save_theme_css, list_audio_input_devices,
             scan_clips, read_thumbnail, read_video_bytes, serve_video, replace_file,
         ])
         .run(tauri::generate_context!())

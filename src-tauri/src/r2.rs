@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -7,6 +8,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 
 use crate::db::Clip;
+use crate::editor;
 use crate::settings::AppSettings;
 
 const ID_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -139,10 +141,10 @@ type R2Result<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub async fn upload(s: &AppSettings, clip: &Clip, permanent: bool) -> R2Result<String> {
     let c = client(s);
-    let ext = Path::new(&clip.path).extension().and_then(|e| e.to_str()).unwrap_or("mp4");
     let id = short_id();
     let prefix = if permanent { "p" } else { "t" };
-    let video_key = format!("{prefix}/{id}.{ext}");
+    let upload_path = ensure_upload_mp4(&clip.path);
+    let video_key = format!("{prefix}/{id}.mp4");
     let thumb_key = format!("{prefix}/{id}.jpg");
     let html_key = format!("{prefix}/{id}");
     let domain = s.r2_custom_domain.trim_end_matches('/');
@@ -150,14 +152,11 @@ pub async fn upload(s: &AppSettings, clip: &Clip, permanent: bool) -> R2Result<S
     let size = std::fs::metadata(&clip.path).map(|m| m.len()).unwrap_or(0);
     let (title, date) = split_filename(&clip.filename);
 
-    // Ensure the video has AAC audio (browsers/Discord can't play opus-in-mp4)
-    let upload_path = ensure_aac(&clip.path);
-
     c.put_object()
         .bucket(&s.r2_bucket)
         .key(&video_key)
         .body(ByteStream::from_path(&upload_path).await?)
-        .content_type(format!("video/{ext}"))
+        .content_type("video/mp4")
         .send()
         .await?;
 
@@ -237,6 +236,79 @@ pub async fn storage_usage(s: &AppSettings, prefix: &str) -> R2Result<u64> {
     Ok(total)
 }
 
+pub async fn purge_non_temp_objects(s: &AppSettings) -> R2Result<(usize, usize)> {
+    let c = client(s);
+    let mut continuation: Option<String> = None;
+    let mut deleted = 0usize;
+    let mut failed = 0usize;
+
+    loop {
+        let mut req = c.list_objects_v2().bucket(&s.r2_bucket);
+        if let Some(token) = &continuation {
+            req = req.continuation_token(token);
+        }
+        let resp = req.send().await?;
+
+        for obj in resp.contents() {
+            let Some(key) = obj.key() else { continue; };
+            if key.starts_with("t/") {
+                continue;
+            }
+            match c.delete_object().bucket(&s.r2_bucket).key(key).send().await {
+                Ok(_) => deleted += 1,
+                Err(_) => failed += 1,
+            }
+        }
+
+        if !resp.is_truncated().unwrap_or(false) {
+            break;
+        }
+        continuation = resp.next_continuation_token().map(String::from);
+        if continuation.is_none() {
+            break;
+        }
+    }
+
+    Ok((deleted, failed))
+}
+
+pub async fn purge_orphan_temp_objects(s: &AppSettings, keep: &HashSet<String>) -> R2Result<(usize, usize)> {
+    let c = client(s);
+    let mut continuation: Option<String> = None;
+    let mut deleted = 0usize;
+    let mut failed = 0usize;
+
+    loop {
+        let mut req = c.list_objects_v2().bucket(&s.r2_bucket).prefix("t/");
+        if let Some(token) = &continuation {
+            req = req.continuation_token(token);
+        }
+        let resp = req.send().await?;
+
+        for obj in resp.contents() {
+            let Some(key) = obj.key() else { continue; };
+            let base = strip_video_ext(key).to_string();
+            if keep.contains(&base) {
+                continue;
+            }
+            match c.delete_object().bucket(&s.r2_bucket).key(key).send().await {
+                Ok(_) => deleted += 1,
+                Err(_) => failed += 1,
+            }
+        }
+
+        if !resp.is_truncated().unwrap_or(false) {
+            break;
+        }
+        continuation = resp.next_continuation_token().map(String::from);
+        if continuation.is_none() {
+            break;
+        }
+    }
+
+    Ok((deleted, failed))
+}
+
 fn strip_video_ext(key: &str) -> &str {
     for ext in [".html", ".mp4", ".mkv", ".webm", ".jpg"] {
         if let Some(s) = key.strip_suffix(ext) { return s; }
@@ -244,8 +316,8 @@ fn strip_video_ext(key: &str) -> &str {
     key
 }
 
-/// If the file has non-AAC audio, remux to a temp file with AAC. Returns path to use for upload.
-fn ensure_aac(path: &str) -> String {
+/// Ensure uploads are browser-friendly MP4/AAC files.
+fn ensure_upload_mp4(path: &str) -> String {
     // FIXME: this spawns ffprobe + potentially ffmpeg on every upload
     // should cache the result per file hash or check once on scan_clips
 
@@ -255,20 +327,23 @@ fn ensure_aac(path: &str) -> String {
         .output();
     let codec = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
 
-    if codec == "aac" {
-        return path.to_string();
+    let audio_count = editor::audio_stream_count(path);
+
+    if codec == "aac" && audio_count <= 1 {
+        let is_mp4 = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").eq_ignore_ascii_case("mp4");
+        if is_mp4 {
+            return path.to_string();
+        }
     }
 
     // TODO: consider supporting passthrough for opus if user explicitly chose it
     // and just warn in the UI that Discord embeds won't work
 
-    // Remux with AAC audio
+    // Remux with one browser-friendly AAC track.
     let tmp = format!("{}.upload.mp4", path);
-    let ok = std::process::Command::new("ffmpeg")
-        .args(["-y", "-i", path, "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", &tmp])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    if ok { tmp } else { path.to_string() }
+    if editor::render_browser_copy(path, &tmp, None).is_ok() {
+        tmp
+    } else {
+        path.to_string()
+    }
 }

@@ -4,15 +4,30 @@
     import { listen } from "@tauri-apps/api/event";
     import { writeText } from "@tauri-apps/plugin-clipboard-manager";
     import { getCurrentWindow } from "@tauri-apps/api/window";
+    import { revealItemInDir } from "@tauri-apps/plugin-opener";
     import { theme, defaultTheme, type ThemeVars } from "./lib/stores/theme";
 
     type Tab = "library" | "uploads" | "permanent" | "settings" | "editor";
     type ToastKind = "ok" | "err";
     type ViewMode = "grid" | "list";
+    type LibraryFilter = "all" | "local" | "uploaded" | "temporary" | "permanent" | "favorite";
+    type LibrarySort = "newest" | "oldest" | "longest" | "shortest" | "name";
+    type SelectOption<T extends string = string> = {
+        value: T;
+        label: string;
+    };
+    type BootPhase = "terminal" | "ready";
+    type UploadStatus =
+        | "queued"
+        | "uploading"
+        | "uploaded"
+        | "failed"
+        | "canceled";
 
     type Clip = {
         id: string;
         filename: string;
+        window_name: string | null;
         path: string;
         duration: number;
         created_at: string;
@@ -24,6 +39,27 @@
         r2_url: string | null;
         expiry_date: string | null;
         is_permanent: boolean;
+        favorite: boolean;
+    };
+
+    type UploadQueueItem = {
+        queueId: string;
+        clipId: string;
+        filename: string;
+        permanent: boolean;
+        status: UploadStatus;
+        progress: number;
+        message: string;
+        url: string | null;
+        error: string | null;
+        autoCopy: boolean;
+        createdAt: number;
+    };
+    type AudioTrack = {
+        index: number;
+        key: string;
+        label: string;
+        isolated: boolean;
     };
 
     let tab = $state<Tab>("library");
@@ -40,9 +76,63 @@
     let thumbCache = $state<Record<string, string>>({});
     let viewMode = $state<ViewMode>("grid");
     let sidebarCollapsed = $state(false);
+    let librarySearch = $state("");
+    let libraryFilter = $state<LibraryFilter>("all");
+    let librarySort = $state<LibrarySort>("newest");
+    let openDropdown = $state<string | null>(null);
+    let audioInputOptions = $state<SelectOption[]>([
+        { value: "default_input", label: "Default input" },
+    ]);
+    let audioInputDevicesLoading = $state(false);
+    let bootPhase = $state<BootPhase>("terminal");
+    let bootProgress = $state(0);
+    let bootTerminalLines = $state<string[]>([]);
+    let uploadQueue = $state<UploadQueueItem[]>([]);
+    let uploadQueueOpen = $state(false);
+    let filteredClips = $derived.by(() => {
+        const query = librarySearch.trim().toLowerCase();
+        return [...clips]
+            .filter((clip) => {
+                if (libraryFilter === "local" && clip.r2_url) return false;
+                if (libraryFilter === "uploaded" && !clip.r2_url) return false;
+                if (libraryFilter === "temporary" && (!clip.r2_url || clip.is_permanent)) return false;
+                if (libraryFilter === "permanent" && (!clip.r2_url || !clip.is_permanent)) return false;
+                if (libraryFilter === "favorite" && !clip.favorite) return false;
+                if (!query) return true;
+
+                return [clip.filename, clip.window_name, clip.tags, clip.folder]
+                    .filter(Boolean)
+                    .some((value) => value!.toLowerCase().includes(query));
+            })
+            .sort((a, b) => {
+                if (a.favorite !== b.favorite) return a.favorite ? -1 : 1;
+                if (librarySort === "oldest") {
+                    return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+                }
+                if (librarySort === "longest") return b.duration - a.duration;
+                if (librarySort === "shortest") return a.duration - b.duration;
+                if (librarySort === "name") return a.filename.localeCompare(b.filename);
+                return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+            });
+    });
+    let activeUploadCount = $derived(
+        uploadQueue.filter(
+            (item) => item.status === "queued" || item.status === "uploading",
+        ).length,
+    );
+    let failedUploadCount = $derived(
+        uploadQueue.filter((item) => item.status === "failed").length,
+    );
+    let settledUploadCount = $derived(
+        uploadQueue.filter(
+            (item) => item.status !== "queued" && item.status !== "uploading",
+        ).length,
+    );
 
     let toast = $state<{ msg: string; kind: ToastKind } | null>(null);
     let toastTimer: any;
+    let uploadWorkerActive = false;
+    const uploadTimers = new Map<string, ReturnType<typeof setInterval>>();
 
     let r2TempBytes = $state(0);
     let r2PermBytes = $state(0);
@@ -54,6 +144,8 @@
     let duration = $state(0);
     let trimStart = $state(0);
     let trimEnd = $state(10);
+    let editorAudioTracks = $state<AudioTrack[]>([]);
+    let editorMutedAudioTracks = $state<Record<number, boolean>>({});
 
     // Theme editor state
     let themeExpanded = $state(false);
@@ -74,32 +166,149 @@
         { key: "--danger", label: "danger" },
     ];
 
+    const libraryFilterOptions: SelectOption<LibraryFilter>[] = [
+        { value: "all", label: "all" },
+        { value: "local", label: "local" },
+        { value: "uploaded", label: "uploaded" },
+        { value: "temporary", label: "temp" },
+        { value: "permanent", label: "perm" },
+        { value: "favorite", label: "pinned" },
+    ];
+
+    const librarySortOptions: SelectOption<LibrarySort>[] = [
+        { value: "newest", label: "newest" },
+        { value: "oldest", label: "oldest" },
+        { value: "longest", label: "longest" },
+        { value: "shortest", label: "shortest" },
+        { value: "name", label: "name" },
+    ];
+
+    const codecOptions: SelectOption[] = [
+        { value: "h264", label: "h264" },
+        { value: "hevc", label: "hevc" },
+        { value: "av1", label: "av1" },
+    ];
+
+    const containerOptions: SelectOption[] = [
+        { value: "mp4", label: "mp4" },
+        { value: "mkv", label: "mkv" },
+        { value: "webm", label: "webm" },
+    ];
+
+    const audioCodecOptions: SelectOption[] = [
+        { value: "aac", label: "aac" },
+        { value: "opus", label: "opus" },
+        { value: "flac", label: "flac" },
+    ];
+
+    const bootTerminalScript = [
+        "$ klyppd --session",
+        ":: initializing terminal session",
+        ":: resolving clip cache",
+        ":: probing recorder backend",
+        ":: preparing library index",
+        ":: handing off to loader",
+    ];
+
     // ─── Lifecycle ─────────────────────────────────────────────────────────
 
     onMount(async () => {
-        await injectUserTheme();
-        theme.apply();
-        settings = await invoke("get_settings");
-        await refresh();
-        setInterval(refresh, 3000);
-        await loadClips();
+        const bootStart = performance.now();
 
-        listen("clip-saved", (e: any) => {
-            notify("Clip saved: " + e.payload.filename);
-            setTimeout(loadClips, 500);
-        });
-        listen("toast", (e: any) => notify(e.payload.msg, e.payload.kind));
+        try {
+            await playBootTerminal();
 
-        // Subscribe to theme store for local reactivity
-        theme.subscribe((v) => {
-            currentTheme = v;
-        });
+            await bootStep(12, async () => {
+                await injectUserTheme();
+                theme.apply();
+            });
+            await bootStep(26, async () => {
+                settings = await invoke("get_settings");
+            });
+            await bootStep(42, async () => {
+                recState = await invoke("get_recording_state");
+            });
+            await bootStep(56, async () => {
+                storageUsage = await invoke("get_storage_usage");
+            });
+            await bootStep(78, loadClips);
+            await bootStep(92, async () => {
+                listen("clip-saved", (e: any) => {
+                    notify("Clip saved: " + e.payload.filename);
+                    setTimeout(loadClips, 500);
+                });
+                listen("toast", (e: any) => notify(e.payload.msg, e.payload.kind));
+
+                // Subscribe to theme store for local reactivity
+                theme.subscribe((v) => {
+                    currentTheme = v;
+                });
+            });
+
+            bootProgress = 100;
+        } catch (e: any) {
+            console.error(e);
+            notify("Startup failed", "err");
+        } finally {
+            setInterval(refresh, 3000);
+            await holdBoot(bootStart, 4300);
+            bootProgress = 100;
+            await sleep(450);
+            bootPhase = "ready";
+            forceRepaint();
+        }
     });
+
+    async function playBootTerminal() {
+        bootTerminalLines = [];
+        for (const line of bootTerminalScript) {
+            bootTerminalLines = [...bootTerminalLines, line];
+            await sleep(320);
+        }
+        await sleep(420);
+    }
+
+    async function bootStep(progress: number, task: () => Promise<void>) {
+        bootProgress = Math.max(bootProgress, progress - 8);
+        await sleep(260);
+        await task();
+        await sleep(140);
+        bootProgress = Math.max(bootProgress, progress);
+    }
+
+    function sleep(ms: number) {
+        return new Promise<void>((resolve) => setTimeout(resolve, ms));
+    }
+
+    async function holdBoot(start: number, minimumMs: number) {
+        const remaining = minimumMs - (performance.now() - start);
+        if (remaining > 0) await sleep(remaining);
+    }
 
     async function injectUserTheme() {
         const css = await invoke<string>("get_theme_css");
         if (!css) return;
         theme.importCSS(css);
+        await applyWindowOpacity(theme.current()["--bg-opacity"]);
+    }
+
+    async function persistTheme() {
+        try {
+            await invoke("save_theme_css", { css: theme.exportCSS() });
+        } catch (e) {
+            console.error(e);
+            notify("Theme save failed", "err");
+        }
+    }
+
+    async function applyWindowOpacity(value: string) {
+        const opacity = Number.parseFloat(value);
+        if (!Number.isFinite(opacity)) return;
+        try {
+            await invoke("set_window_opacity", { opacity });
+        } catch (e) {
+            console.error(e);
+        }
     }
 
     // ─── Notifications ─────────────────────────────────────────────────────
@@ -130,6 +339,9 @@
         recState = await invoke("get_recording_state");
         if (tab !== "settings") settings = await invoke("get_settings");
         storageUsage = await invoke("get_storage_usage");
+        if (tab === "uploads" || tab === "permanent") {
+            await refreshR2TabState();
+        }
     }
 
     async function loadClips() {
@@ -151,7 +363,14 @@
         // Force webkit2gtk repaint (transparent bg rendering bug)
         forceRepaint();
         if (t === "library") await loadClips();
-        if (t === "uploads") {
+        if (t === "uploads" || t === "permanent") {
+            await refreshR2TabState();
+        }
+        if (t === "settings") await loadAudioInputDevices();
+    }
+
+    async function refreshR2TabState() {
+        if (tab === "uploads") {
             uploadedClips = await invoke("get_uploaded_clips", {
                 permanent: false,
             });
@@ -161,7 +380,7 @@
                 permanent: false,
             }).catch(() => 0);
         }
-        if (t === "permanent") {
+        if (tab === "permanent") {
             permanentClips = await invoke("get_uploaded_clips", {
                 permanent: true,
             });
@@ -194,21 +413,224 @@
 
     // ─── Sharing ───────────────────────────────────────────────────────────
 
-    async function upload(clip: Clip, permanent: boolean) {
+    function enqueueUpload(clip: Clip, permanent: boolean, event: MouseEvent) {
+        if (!event.isTrusted) {
+            notify("Upload blocked", "err");
+            return;
+        }
+        if (clip.r2_url) {
+            void copyLink(clip);
+            return;
+        }
+        const existing = activeUploadFor(clip.id, permanent);
+        if (existing) {
+            uploadQueueOpen = true;
+            notify(existing.status === "queued" ? "Upload queued" : "Upload running");
+            return;
+        }
+
+        uploadQueue = [
+            ...uploadQueue,
+            {
+                queueId: `${clip.id}-${permanent ? "p" : "t"}-${Date.now()}`,
+                clipId: clip.id,
+                filename: clip.filename,
+                permanent,
+                status: "queued",
+                progress: 0,
+                message: "queued",
+                url: null,
+                error: null,
+                autoCopy: true,
+                createdAt: Date.now(),
+            },
+        ];
+        uploadQueueOpen = true;
+        void processUploadQueue();
+    }
+
+    async function processUploadQueue() {
+        if (uploadWorkerActive) return;
+        uploadWorkerActive = true;
+
+        try {
+            while (true) {
+                const next = uploadQueue
+                    .filter((item) => item.status === "queued")
+                    .sort((a, b) => a.createdAt - b.createdAt)[0];
+                if (!next) break;
+                await runUpload(next);
+            }
+        } finally {
+            uploadWorkerActive = false;
+        }
+    }
+
+    async function runUpload(item: UploadQueueItem) {
+        setUploadItem(item.queueId, {
+            status: "uploading",
+            progress: 8,
+            message: "preparing",
+            error: null,
+        });
+        startUploadProgress(item.queueId);
+
         try {
             const url = await invoke<string>("upload_clip", {
-                id: clip.id,
-                permanent,
+                id: item.clipId,
+                permanent: item.permanent,
             });
-            await writeText(url);
-            notify(permanent ? "Permanent link copied" : "Link copied");
-        } catch {
+            stopUploadProgress(item.queueId);
+            setUploadItem(item.queueId, {
+                status: "uploaded",
+                progress: 100,
+                message: "uploaded",
+                url,
+            });
+
+            if (item.autoCopy) {
+                await writeText(url);
+                notify(item.permanent ? "Permanent link copied" : "Link copied");
+            } else {
+                notify("Upload complete");
+            }
+
+            await refreshUploadViews(item.permanent);
+        } catch (e: any) {
+            stopUploadProgress(item.queueId);
+            setUploadItem(item.queueId, {
+                status: "failed",
+                progress: 100,
+                message: "failed",
+                error: String(e || "Upload failed"),
+            });
             notify("Upload failed", "err");
         }
     }
 
-    const quickShare = (c: Clip) => upload(c, false);
-    const permUpload = (c: Clip) => upload(c, true);
+    function startUploadProgress(queueId: string) {
+        stopUploadProgress(queueId);
+        const timer = setInterval(() => {
+            const item = uploadQueue.find((u) => u.queueId === queueId);
+            if (!item || item.status !== "uploading") {
+                stopUploadProgress(queueId);
+                return;
+            }
+
+            const progress = Math.min(
+                92,
+                item.progress + (item.progress < 45 ? 5 : item.progress < 75 ? 2 : 1),
+            );
+            const message =
+                progress < 18
+                    ? "preparing"
+                    : progress < 72
+                      ? "uploading video"
+                      : progress < 88
+                        ? "uploading assets"
+                        : "finalizing";
+            setUploadItem(queueId, { progress, message });
+        }, 350);
+        uploadTimers.set(queueId, timer);
+    }
+
+    function stopUploadProgress(queueId: string) {
+        const timer = uploadTimers.get(queueId);
+        if (!timer) return;
+        clearInterval(timer);
+        uploadTimers.delete(queueId);
+    }
+
+    function setUploadItem(
+        queueId: string,
+        patch: Partial<Omit<UploadQueueItem, "queueId">>,
+    ) {
+        uploadQueue = uploadQueue.map((item) =>
+            item.queueId === queueId ? { ...item, ...patch } : item,
+        );
+    }
+
+    function activeUploadFor(clipId: string, permanent: boolean) {
+        return uploadQueue.find(
+            (item) =>
+                item.clipId === clipId &&
+                item.permanent === permanent &&
+                (item.status === "queued" || item.status === "uploading"),
+        );
+    }
+
+    function uploadButtonLabel(clipId: string, permanent: boolean, fallback: string) {
+        const item = activeUploadFor(clipId, permanent);
+        if (!item) return fallback;
+        if (item.status === "queued") return "queued";
+        return `${Math.round(item.progress)}%`;
+    }
+
+    function uploadIconLabel(clipId: string, permanent: boolean) {
+        const item = activeUploadFor(clipId, permanent);
+        if (!item) return "⬆";
+        if (item.status === "queued") return "…";
+        return `${Math.round(item.progress)}%`;
+    }
+
+    function uploadStatusText(item: UploadQueueItem) {
+        if (item.status === "uploaded") return item.permanent ? "permanent" : "temporary";
+        if (item.status === "failed") return item.error || "failed";
+        return item.message;
+    }
+
+    function retryUpload(item: UploadQueueItem) {
+        setUploadItem(item.queueId, {
+            status: "queued",
+            progress: 0,
+            message: "queued",
+            error: null,
+            url: null,
+            createdAt: Date.now(),
+        });
+        uploadQueueOpen = true;
+        void processUploadQueue();
+    }
+
+    function cancelQueuedUpload(item: UploadQueueItem) {
+        if (item.status !== "queued") return;
+        setUploadItem(item.queueId, {
+            status: "canceled",
+            progress: 0,
+            message: "canceled",
+        });
+    }
+
+    async function copyQueuedLink(item: UploadQueueItem) {
+        if (!item.url) return;
+        await writeText(item.url);
+        notify("Link copied");
+    }
+
+    function dismissUpload(queueId: string) {
+        stopUploadProgress(queueId);
+        uploadQueue = uploadQueue.filter((item) => item.queueId !== queueId);
+    }
+
+    function clearSettledUploads() {
+        for (const item of uploadQueue) {
+            if (item.status !== "queued" && item.status !== "uploading") {
+                stopUploadProgress(item.queueId);
+            }
+        }
+        uploadQueue = uploadQueue.filter(
+            (item) => item.status === "queued" || item.status === "uploading",
+        );
+    }
+
+    async function refreshUploadViews(permanent: boolean) {
+        await loadClips();
+        if (tab === "uploads" && !permanent) await switchTab("uploads");
+        if (tab === "permanent" && permanent) await switchTab("permanent");
+    }
+
+    const quickShare = (c: Clip, e: MouseEvent) => enqueueUpload(c, false, e);
+    const permUpload = (c: Clip, e: MouseEvent) => enqueueUpload(c, true, e);
 
     async function copyLink(clip: Clip) {
         if (!clip.r2_url) return;
@@ -216,10 +638,97 @@
         notify("Link copied");
     }
 
+    async function copyPath(clip: Clip) {
+        await writeText(clip.path);
+        notify("Path copied");
+    }
+
+    async function revealClip(clip: Clip) {
+        try {
+            await revealItemInDir(clip.path);
+        } catch {
+            notify("Reveal failed", "err");
+        }
+    }
+
+    async function toggleFavorite(clip: Clip) {
+        const favorite = !clip.favorite;
+        try {
+            await invoke("update_clip_favorite", { id: clip.id, favorite });
+            clips = clips.map((c) => (c.id === clip.id ? { ...c, favorite } : c));
+            uploadedClips = uploadedClips.map((c) =>
+                c.id === clip.id ? { ...c, favorite } : c,
+            );
+            permanentClips = permanentClips.map((c) =>
+                c.id === clip.id ? { ...c, favorite } : c,
+            );
+            notify(favorite ? "Pinned" : "Unpinned");
+        } catch {
+            notify("Favorite failed", "err");
+        }
+    }
+
+    function resetLibraryControls() {
+        librarySearch = "";
+        libraryFilter = "all";
+        librarySort = "newest";
+    }
+
+    function selectedLabel(options: SelectOption[], value: string | undefined) {
+        return options.find((option) => option.value === value)?.label ?? value ?? "";
+    }
+
+    function toggleDropdown(id: string) {
+        openDropdown = openDropdown === id ? null : id;
+    }
+
+    function closeDropdown() {
+        openDropdown = null;
+    }
+
+    function handleDropdownKey(
+        e: KeyboardEvent,
+        id: string,
+        options: SelectOption[],
+        value: string,
+        setValue: (value: string) => void,
+    ) {
+        if (e.key === "Escape") {
+            closeDropdown();
+            return;
+        }
+        if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            toggleDropdown(id);
+            return;
+        }
+        if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+
+        e.preventDefault();
+        const current = Math.max(
+            0,
+            options.findIndex((option) => option.value === value),
+        );
+        const delta = e.key === "ArrowDown" ? 1 : -1;
+        const next = (current + delta + options.length) % options.length;
+        setValue(options[next].value);
+    }
+
     async function deleteClip(clip: Clip) {
+        if (clip.r2_url) {
+            try {
+                await invoke("delete_from_r2", { id: clip.id });
+            } catch (e) {
+                notify("R2 delete failed", "err");
+                return;
+            }
+        }
         await invoke("delete_clip", { id: clip.id });
         notify("Deleted");
         await loadClips();
+        if (tab === "uploads" || tab === "permanent") {
+            await refreshR2TabState();
+        }
     }
 
     async function renameClip(clip: Clip) {
@@ -249,11 +758,44 @@
         trimEnd = clip.duration || 10;
         tab = "editor";
         previewSrc = "";
+        editorAudioTracks = [];
+        editorMutedAudioTracks = {};
+
+        try {
+            editorAudioTracks = await invoke<AudioTrack[]>("get_clip_audio_tracks", {
+                path: clip.path,
+            });
+            await loadEditorPreview();
+        } catch (e) {
+            console.error(e);
+            notify("Preview failed", "err");
+        }
+    }
+
+    function closeEditor() {
+        previewSrc = "";
+        editClip = null;
+        editorAudioTracks = [];
+        editorMutedAudioTracks = {};
+        tab = "library";
+    }
+
+    function enabledEditorAudioTracks() {
+        if (editorAudioTracks.length === 0) return null;
+        return editorAudioTracks
+            .filter((track) => !editorMutedAudioTracks[track.index])
+            .map((track) => track.index);
+    }
+
+    async function loadEditorPreview() {
+        if (!editClip) return;
         previewLoading = true;
+        previewSrc = "";
 
         try {
             const path = await invoke<string>("transcode_for_preview", {
-                input: clip.path,
+                input: editClip.path,
+                enabledAudioTracks: enabledEditorAudioTracks(),
             });
             previewSrc = await invoke<string>("serve_video", { path });
         } catch (e) {
@@ -264,10 +806,12 @@
         }
     }
 
-    function closeEditor() {
-        previewSrc = "";
-        editClip = null;
-        tab = "library";
+    function toggleEditorAudioTrack(track: AudioTrack) {
+        editorMutedAudioTracks = {
+            ...editorMutedAudioTracks,
+            [track.index]: !editorMutedAudioTracks[track.index],
+        };
+        void loadEditorPreview();
     }
 
     async function exportTrim(mode: "copy" | "overwrite" = "copy") {
@@ -287,6 +831,7 @@
                 output: tmp,
                 start: trimStart,
                 end: trimEnd,
+                enabledAudioTracks: enabledEditorAudioTracks(),
             });
             await invoke("replace_file", { src: tmp, dst: final_path });
             notify(mode === "overwrite" ? "Clip overwritten" : "Saved as copy");
@@ -305,14 +850,45 @@
         notify("Settings saved");
     }
 
+    async function loadAudioInputDevices() {
+        audioInputDevicesLoading = true;
+        try {
+            const devices = await invoke<SelectOption[]>("list_audio_input_devices");
+            audioInputOptions = devices.length
+                ? devices
+                : [{ value: "default_input", label: "Default input" }];
+        } catch (e) {
+            console.error(e);
+            audioInputOptions = [{ value: "default_input", label: "Default input" }];
+            notify("Mic list failed", "err");
+        } finally {
+            audioInputDevicesLoading = false;
+        }
+    }
+
+    function updateAudioSetting(key: string, value: string | boolean) {
+        settings = { ...settings, [key]: value };
+        void invoke("save_settings", { newSettings: settings }).catch((e) => {
+            console.error(e);
+            notify("Audio setting save failed", "err");
+        });
+    }
+
+    function updateAudioToggle(key: string, value: boolean) {
+        updateAudioSetting(key, value);
+    }
+
     // ─── Theme ─────────────────────────────────────────────────────────────
 
     function setThemeVar(key: keyof ThemeVars, value: string) {
         theme.updateVar(key, value);
+        void persistTheme();
     }
 
     function resetTheme() {
         theme.reset();
+        void persistTheme();
+        void applyWindowOpacity(theme.current()["--bg-opacity"]);
         notify("Theme reset to defaults");
     }
 
@@ -330,10 +906,12 @@
             const file = input.files?.[0];
             if (!file) return;
             const reader = new FileReader();
-            reader.onload = () => {
-                theme.importCSS(reader.result as string);
-                notify("Theme imported");
-            };
+                reader.onload = () => {
+                    theme.importCSS(reader.result as string);
+                    void persistTheme();
+                    void applyWindowOpacity(theme.current()["--bg-opacity"]);
+                    notify("Theme imported");
+                };
             reader.readAsText(file);
         };
         input.click();
@@ -370,6 +948,118 @@
         <span class="toast-prefix">{toast.kind === "err" ? "✗" : "→"}</span
         >{toast.msg}
     </div>
+{/if}
+
+{#if uploadQueue.length > 0}
+    <aside class="upload-dock" class:closed={!uploadQueueOpen}>
+        <button
+            class="upload-dock-head"
+            onclick={() => (uploadQueueOpen = !uploadQueueOpen)}
+            title={uploadQueueOpen ? "Hide upload queue" : "Show upload queue"}
+        >
+            <span>uploads</span>
+            <span class="upload-dock-meta">
+                {#if activeUploadCount > 0}{activeUploadCount} active{/if}
+                {#if activeUploadCount > 0 && failedUploadCount > 0} / {/if}
+                {#if failedUploadCount > 0}{failedUploadCount} failed{/if}
+                {#if activeUploadCount === 0 && failedUploadCount === 0}
+                    {uploadQueue.length} done
+                {/if}
+            </span>
+            <span class="upload-dock-toggle">{uploadQueueOpen ? "▾" : "▴"}</span>
+        </button>
+
+        {#if uploadQueueOpen}
+            <div class="upload-queue">
+                {#each uploadQueue as item (item.queueId)}
+                    <div class="upload-item" class:failed={item.status === "failed"}>
+                        <div class="upload-row">
+                            <div class="upload-main">
+                                <span class="upload-name" title={item.filename}
+                                    >{item.filename}</span
+                                >
+                                <span class="upload-sub"
+                                    >{item.permanent ? "permanent" : "temporary"} · {uploadStatusText(
+                                        item,
+                                    )}</span
+                                >
+                            </div>
+                            <div class="upload-actions">
+                                {#if item.status === "uploaded"}
+                                    <button
+                                        class="queue-btn"
+                                        onclick={() => copyQueuedLink(item)}>copy</button
+                                    >
+                                    <button
+                                        class="queue-btn"
+                                        onclick={() => dismissUpload(item.queueId)}
+                                        >clear</button
+                                    >
+                                {:else if item.status === "failed"}
+                                    <button
+                                        class="queue-btn"
+                                        onclick={() => retryUpload(item)}>retry</button
+                                    >
+                                    <button
+                                        class="queue-btn"
+                                        onclick={() => dismissUpload(item.queueId)}
+                                        >clear</button
+                                    >
+                                {:else if item.status === "queued"}
+                                    <button
+                                        class="queue-btn"
+                                        onclick={() => cancelQueuedUpload(item)}
+                                        >cancel</button
+                                    >
+                                {:else if item.status === "canceled"}
+                                    <button
+                                        class="queue-btn"
+                                        onclick={() => dismissUpload(item.queueId)}
+                                        >clear</button
+                                    >
+                                {/if}
+                            </div>
+                        </div>
+                        <div class="upload-progress" aria-label={item.message}>
+                            <div
+                                class="upload-progress-fill"
+                                style="width: {item.progress}%"
+                            ></div>
+                        </div>
+                    </div>
+                {/each}
+                {#if settledUploadCount > 0}
+                    <button class="clear-uploads" onclick={clearSettledUploads}>
+                        clear inactive
+                    </button>
+                {/if}
+            </div>
+        {/if}
+    </aside>
+{/if}
+
+{#if bootPhase !== "ready"}
+    <section class="boot-screen" aria-label="Loading Klyppd">
+        <div class="boot-terminal" aria-label="Boot terminal">
+            <div class="boot-terminal-head">
+                <span>klyppd tty1</span>
+                <span>{Math.round(bootProgress)}%</span>
+            </div>
+            <div class="boot-terminal-lines">
+                {#each bootTerminalLines as line}
+                    <div>{line}</div>
+                {/each}
+                <span class="boot-cursor" aria-hidden="true">_</span>
+            </div>
+            <div class="boot-progress-label">
+                <span>loading klyppd</span>
+                <span>{Math.round(bootProgress)}%</span>
+            </div>
+            <div class="boot-bar" aria-hidden="true">
+                <div class="boot-bar-fill" style="width: {bootProgress}%"></div>
+            </div>
+        </div>
+    </section>
 {/if}
 
 <div class="app">
@@ -505,9 +1195,104 @@
                     <div class="page-title">
                         <span class="prompt">~</span>
                         <h1>library</h1>
-                        <span class="count">{clips.length}</span>
+                        <span class="count">{filteredClips.length}/{clips.length}</span>
                     </div>
                     <div class="page-controls">
+                        <input
+                            class="library-search"
+                            bind:value={librarySearch}
+                            placeholder="search"
+                            aria-label="Search clips"
+                        />
+                        <div class="terminal-select" class:open={openDropdown === "library-filter"}>
+                            <button
+                                type="button"
+                                class="terminal-select-btn"
+                                aria-haspopup="listbox"
+                                aria-expanded={openDropdown === "library-filter"}
+                                onclick={() => toggleDropdown("library-filter")}
+                                onkeydown={(e) =>
+                                    handleDropdownKey(
+                                        e,
+                                        "library-filter",
+                                        libraryFilterOptions,
+                                        libraryFilter,
+                                        (value) => (libraryFilter = value as LibraryFilter),
+                                    )}
+                            >
+                                <span>{selectedLabel(libraryFilterOptions, libraryFilter)}</span>
+                                <span class="terminal-caret">▾</span>
+                            </button>
+                            {#if openDropdown === "library-filter"}
+                                <div class="terminal-menu" role="listbox">
+                                    {#each libraryFilterOptions as option}
+                                        <button
+                                            type="button"
+                                            class:sel={libraryFilter === option.value}
+                                            role="option"
+                                            aria-selected={libraryFilter === option.value}
+                                            onclick={() => {
+                                                libraryFilter = option.value;
+                                                closeDropdown();
+                                            }}
+                                        >
+                                            <span class="terminal-check"
+                                                >{libraryFilter === option.value ? ">" : ""}</span
+                                            >
+                                            {option.label}
+                                        </button>
+                                    {/each}
+                                </div>
+                            {/if}
+                        </div>
+                        <div class="terminal-select" class:open={openDropdown === "library-sort"}>
+                            <button
+                                type="button"
+                                class="terminal-select-btn"
+                                aria-haspopup="listbox"
+                                aria-expanded={openDropdown === "library-sort"}
+                                onclick={() => toggleDropdown("library-sort")}
+                                onkeydown={(e) =>
+                                    handleDropdownKey(
+                                        e,
+                                        "library-sort",
+                                        librarySortOptions,
+                                        librarySort,
+                                        (value) => (librarySort = value as LibrarySort),
+                                    )}
+                            >
+                                <span>{selectedLabel(librarySortOptions, librarySort)}</span>
+                                <span class="terminal-caret">▾</span>
+                            </button>
+                            {#if openDropdown === "library-sort"}
+                                <div class="terminal-menu" role="listbox">
+                                    {#each librarySortOptions as option}
+                                        <button
+                                            type="button"
+                                            class:sel={librarySort === option.value}
+                                            role="option"
+                                            aria-selected={librarySort === option.value}
+                                            onclick={() => {
+                                                librarySort = option.value;
+                                                closeDropdown();
+                                            }}
+                                        >
+                                            <span class="terminal-check"
+                                                >{librarySort === option.value ? ">" : ""}</span
+                                            >
+                                            {option.label}
+                                        </button>
+                                    {/each}
+                                </div>
+                            {/if}
+                        </div>
+                        {#if librarySearch || libraryFilter !== "all" || librarySort !== "newest"}
+                            <button
+                                class="view-toggle"
+                                onclick={resetLibraryControls}
+                                title="Clear filters">×</button
+                            >
+                        {/if}
                         <button
                             class="view-toggle"
                             class:active={viewMode === "grid"}
@@ -540,10 +1325,17 @@
                             > while buffer is running
                         </p>
                     </div>
+                {:else if filteredClips.length === 0}
+                    <div class="empty">
+                        <pre class="empty-art">  ╭─────────────────╮
+  │  no matches     │
+  ╰─────────────────╯</pre>
+                        <p>clear filters or try another search</p>
+                    </div>
                 {:else if viewMode === "grid"}
                     <div class="grid">
-                        {#each clips as clip}
-                            <article class="clip-card">
+                        {#each filteredClips as clip}
+                            <article class="clip-card" class:fav={clip.favorite}>
                                 <div
                                     class="clip-thumb"
                                     role="button"
@@ -581,6 +1373,13 @@
                                     >
                                 </div>
                                 <div class="clip-actions">
+                                    <button
+                                        class="act-sec pin"
+                                        class:on={clip.favorite}
+                                        onclick={() => toggleFavorite(clip)}
+                                        title={clip.favorite ? "unpin" : "pin"}
+                                        >{clip.favorite ? "◆" : "◇"}</button
+                                    >
                                     {#if clip.r2_url}
                                         <button
                                             class="act-primary"
@@ -594,19 +1393,34 @@
                                     {:else}
                                         <button
                                             class="act-primary"
-                                            onclick={() => quickShare(clip)}
-                                            >share</button
+                                            onclick={(e) => quickShare(clip, e)}
+                                            >{uploadButtonLabel(
+                                                clip.id,
+                                                false,
+                                                "share",
+                                            )}</button
                                         >
                                         <button
                                             class="act-sec"
-                                            onclick={() => permUpload(clip)}
-                                            title="permanent upload">⬆</button
+                                            onclick={(e) => permUpload(clip, e)}
+                                            title="permanent upload"
+                                            >{uploadIconLabel(clip.id, true)}</button
                                         >
                                     {/if}
                                     <button
                                         class="act-sec"
                                         onclick={() => deleteClip(clip)}
                                         title="delete">✕</button
+                                    >
+                                    <button
+                                        class="act-sec"
+                                        onclick={() => revealClip(clip)}
+                                        title="reveal">↗</button
+                                    >
+                                    <button
+                                        class="act-sec"
+                                        onclick={() => copyPath(clip)}
+                                        title="copy path">⎘</button
                                     >
                                     <button
                                         class="act-sec"
@@ -619,9 +1433,10 @@
                     </div>
                 {:else}
                     <div class="list">
-                        {#each clips as clip}
+                        {#each filteredClips as clip}
                             <div
                                 class="list-row"
+                                class:fav={clip.favorite}
                                 role="button"
                                 tabindex="0"
                                 onclick={() => openEditor(clip)}
@@ -658,6 +1473,13 @@
                                     class="list-actions"
                                     onclick={(e) => e.stopPropagation()}
                                 >
+                                    <button
+                                        class="act-sec pin"
+                                        class:on={clip.favorite}
+                                        onclick={() => toggleFavorite(clip)}
+                                        title={clip.favorite ? "unpin" : "pin"}
+                                        >{clip.favorite ? "◆" : "◇"}</button
+                                    >
                                     {#if clip.r2_url}
                                         <button
                                             class="act-primary"
@@ -667,19 +1489,28 @@
                                     {:else}
                                         <button
                                             class="act-primary"
-                                            onclick={() => quickShare(clip)}
-                                            >share</button
+                                            onclick={(e) => quickShare(clip, e)}
+                                            >{uploadButtonLabel(
+                                                clip.id,
+                                                false,
+                                                "share",
+                                            )}</button
                                         >
                                         <button
                                             class="act-sec"
-                                            onclick={() => permUpload(clip)}
-                                            >⬆</button
+                                            onclick={(e) => permUpload(clip, e)}
+                                            >{uploadIconLabel(clip.id, true)}</button
                                         >
                                     {/if}
                                     <button
                                         class="act-sec del"
                                         onclick={() => deleteClip(clip)}
                                         >✕</button
+                                    >
+                                    <button
+                                        class="act-sec"
+                                        onclick={() => revealClip(clip)}
+                                        title="reveal">↗</button
                                     >
                                 </div>
                             </div>
@@ -708,7 +1539,7 @@
                 {:else}
                     <div class="grid">
                         {#each uploadedClips as clip}
-                            <article class="clip-card">
+                            <article class="clip-card" class:fav={clip.favorite}>
                                 <div
                                     class="clip-thumb"
                                     role="button"
@@ -746,9 +1577,21 @@
                                 </div>
                                 <div class="clip-actions">
                                     <button
+                                        class="act-sec pin"
+                                        class:on={clip.favorite}
+                                        onclick={() => toggleFavorite(clip)}
+                                        title={clip.favorite ? "unpin" : "pin"}
+                                        >{clip.favorite ? "◆" : "◇"}</button
+                                    >
+                                    <button
                                         class="act-primary"
                                         onclick={() => copyLink(clip)}
                                         >copy link</button
+                                    >
+                                    <button
+                                        class="act-sec"
+                                        onclick={() => revealClip(clip)}
+                                        title="reveal">↗</button
                                     >
                                     <button
                                         class="act-sec del"
@@ -781,7 +1624,7 @@
                 {:else}
                     <div class="grid">
                         {#each permanentClips as clip}
-                            <article class="clip-card">
+                            <article class="clip-card" class:fav={clip.favorite}>
                                 <div
                                     class="clip-thumb"
                                     role="button"
@@ -815,9 +1658,21 @@
                                 </div>
                                 <div class="clip-actions">
                                     <button
+                                        class="act-sec pin"
+                                        class:on={clip.favorite}
+                                        onclick={() => toggleFavorite(clip)}
+                                        title={clip.favorite ? "unpin" : "pin"}
+                                        >{clip.favorite ? "◆" : "◇"}</button
+                                    >
+                                    <button
                                         class="act-primary"
                                         onclick={() => copyLink(clip)}
                                         >copy link</button
+                                    >
+                                    <button
+                                        class="act-sec"
+                                        onclick={() => revealClip(clip)}
+                                        title="reveal">↗</button
                                     >
                                     <button
                                         class="act-sec del"
@@ -852,6 +1707,24 @@
                             save copy ({fmt(trimEnd - trimStart)})
                         </button>
                     </div>
+
+                    {#if editorAudioTracks.length > 0}
+                        <div class="audio-track-strip">
+                            {#each editorAudioTracks as track}
+                                <button
+                                    type="button"
+                                    class="audio-track-toggle"
+                                    class:muted={editorMutedAudioTracks[track.index]}
+                                    class:mixed={!track.isolated}
+                                    onclick={() => toggleEditorAudioTrack(track)}
+                                    title={track.isolated ? track.label : `${track.label} may include app audio`}
+                                >
+                                    <span>{editorMutedAudioTracks[track.index] ? "off" : "on"}</span>
+                                    {track.label}
+                                </button>
+                            {/each}
+                        </div>
+                    {/if}
 
                     <div class="video-wrap">
                         {#if previewLoading}
@@ -1056,25 +1929,256 @@
                             </div>
                         </div>
                         <div class="cfg">
-                            <label>codec</label><select
-                                bind:value={settings.codec}
-                                ><option>h264</option><option>hevc</option
-                                ><option>av1</option></select
-                            >
+                            <label>codec</label>
+                            <div class="terminal-select cfg-select" class:open={openDropdown === "settings-codec"}>
+                                <button
+                                    type="button"
+                                    class="terminal-select-btn"
+                                    aria-haspopup="listbox"
+                                    aria-expanded={openDropdown === "settings-codec"}
+                                    onclick={() => toggleDropdown("settings-codec")}
+                                    onkeydown={(e) =>
+                                        handleDropdownKey(
+                                            e,
+                                            "settings-codec",
+                                            codecOptions,
+                                            settings.codec || "h264",
+                                            (value) => (settings.codec = value),
+                                        )}
+                                >
+                                    <span>{selectedLabel(codecOptions, settings.codec || "h264")}</span>
+                                    <span class="terminal-caret">▾</span>
+                                </button>
+                                {#if openDropdown === "settings-codec"}
+                                    <div class="terminal-menu" role="listbox">
+                                        {#each codecOptions as option}
+                                            <button
+                                                type="button"
+                                                class:sel={(settings.codec || "h264") === option.value}
+                                                role="option"
+                                                aria-selected={(settings.codec || "h264") === option.value}
+                                                onclick={() => {
+                                                    settings.codec = option.value;
+                                                    closeDropdown();
+                                                }}
+                                            >
+                                                <span class="terminal-check"
+                                                    >{(settings.codec || "h264") === option.value
+                                                        ? ">"
+                                                        : ""}</span
+                                                >
+                                                {option.label}
+                                            </button>
+                                        {/each}
+                                    </div>
+                                {/if}
+                            </div>
                         </div>
                         <div class="cfg">
-                            <label>container</label><select
-                                bind:value={settings.container}
-                                ><option>mp4</option><option>mkv</option><option
-                                    >webm</option
-                                ></select
-                            >
+                            <label>container</label>
+                            <div class="terminal-select cfg-select" class:open={openDropdown === "settings-container"}>
+                                <button
+                                    type="button"
+                                    class="terminal-select-btn"
+                                    aria-haspopup="listbox"
+                                    aria-expanded={openDropdown === "settings-container"}
+                                    onclick={() => toggleDropdown("settings-container")}
+                                    onkeydown={(e) =>
+                                        handleDropdownKey(
+                                            e,
+                                            "settings-container",
+                                            containerOptions,
+                                            settings.container || "mp4",
+                                            (value) => (settings.container = value),
+                                        )}
+                                >
+                                    <span>{selectedLabel(containerOptions, settings.container || "mp4")}</span>
+                                    <span class="terminal-caret">▾</span>
+                                </button>
+                                {#if openDropdown === "settings-container"}
+                                    <div class="terminal-menu" role="listbox">
+                                        {#each containerOptions as option}
+                                            <button
+                                                type="button"
+                                                class:sel={(settings.container || "mp4") === option.value}
+                                                role="option"
+                                                aria-selected={(settings.container || "mp4") === option.value}
+                                                onclick={() => {
+                                                    settings.container = option.value;
+                                                    closeDropdown();
+                                                }}
+                                            >
+                                                <span class="terminal-check"
+                                                    >{(settings.container || "mp4") === option.value
+                                                        ? ">"
+                                                        : ""}</span
+                                                >
+                                                {option.label}
+                                            </button>
+                                        {/each}
+                                    </div>
+                                {/if}
+                            </div>
                         </div>
                         <div class="cfg">
-                            <label>audio_codec</label><select
-                                bind:value={settings.audio_codec}
-                                ><option>aac</option><option>opus</option><option>flac</option></select
+                            <label>audio_codec</label>
+                            <div class="terminal-select cfg-select" class:open={openDropdown === "settings-audio-codec"}>
+                                <button
+                                    type="button"
+                                    class="terminal-select-btn"
+                                    aria-haspopup="listbox"
+                                    aria-expanded={openDropdown === "settings-audio-codec"}
+                                    onclick={() => toggleDropdown("settings-audio-codec")}
+                                    onkeydown={(e) =>
+                                        handleDropdownKey(
+                                            e,
+                                            "settings-audio-codec",
+                                            audioCodecOptions,
+                                            settings.audio_codec || "aac",
+                                            (value) => (settings.audio_codec = value),
+                                        )}
+                                >
+                                    <span>{selectedLabel(audioCodecOptions, settings.audio_codec || "aac")}</span>
+                                    <span class="terminal-caret">▾</span>
+                                </button>
+                                {#if openDropdown === "settings-audio-codec"}
+                                    <div class="terminal-menu" role="listbox">
+                                        {#each audioCodecOptions as option}
+                                            <button
+                                                type="button"
+                                                class:sel={(settings.audio_codec || "aac") === option.value}
+                                                role="option"
+                                                aria-selected={(settings.audio_codec || "aac") === option.value}
+                                                onclick={() => {
+                                                    settings.audio_codec = option.value;
+                                                    closeDropdown();
+                                                }}
+                                            >
+                                                <span class="terminal-check"
+                                                    >{(settings.audio_codec || "aac") === option.value
+                                                        ? ">"
+                                                        : ""}</span
+                                                >
+                                                {option.label}
+                                            </button>
+                                        {/each}
+                                    </div>
+                                {/if}
+                            </div>
+                        </div>
+                        <div class="cfg">
+                            <span class="cfg-label">focused_window</span>
+                            <button
+                                type="button"
+                                class="terminal-toggle"
+                                class:on={settings.audio_focused_window ?? true}
+                                aria-pressed={settings.audio_focused_window ?? true}
+                                onclick={() =>
+                                    updateAudioToggle(
+                                        "audio_focused_window",
+                                        !(settings.audio_focused_window ?? true),
+                                    )}
                             >
+                                <span>{settings.audio_focused_window ?? true ? "on" : "off"}</span>
+                            </button>
+                        </div>
+                        <div class="cfg">
+                            <span class="cfg-label">discord</span>
+                            <button
+                                type="button"
+                                class="terminal-toggle"
+                                class:on={settings.audio_discord}
+                                aria-pressed={!!settings.audio_discord}
+                                onclick={() =>
+                                    updateAudioToggle(
+                                        "audio_discord",
+                                        !settings.audio_discord,
+                                    )}
+                            >
+                                <span>{settings.audio_discord ? "on" : "off"}</span>
+                            </button>
+                        </div>
+                        <div class="cfg">
+                            <span class="cfg-label">spotify</span>
+                            <button
+                                type="button"
+                                class="terminal-toggle"
+                                class:on={settings.audio_spotify}
+                                aria-pressed={!!settings.audio_spotify}
+                                onclick={() =>
+                                    updateAudioToggle(
+                                        "audio_spotify",
+                                        !settings.audio_spotify,
+                                    )}
+                            >
+                                <span>{settings.audio_spotify ? "on" : "off"}</span>
+                            </button>
+                        </div>
+                        <div class="cfg">
+                            <span class="cfg-label">microphone</span>
+                            <button
+                                type="button"
+                                class="terminal-toggle"
+                                class:on={settings.audio_microphone}
+                                aria-pressed={!!settings.audio_microphone}
+                                onclick={() =>
+                                    updateAudioToggle(
+                                        "audio_microphone",
+                                        !settings.audio_microphone,
+                                    )}
+                            >
+                                <span>{settings.audio_microphone ? "on" : "off"}</span>
+                            </button>
+                        </div>
+                        <div class="cfg">
+                            <span class="cfg-label">microphone_source</span>
+                            <div class="terminal-select cfg-select" class:open={openDropdown === "settings-mic-source"}>
+                                <button
+                                    type="button"
+                                    class="terminal-select-btn"
+                                    aria-haspopup="listbox"
+                                    aria-expanded={openDropdown === "settings-mic-source"}
+                                    disabled={audioInputDevicesLoading}
+                                    onclick={() => toggleDropdown("settings-mic-source")}
+                                    onkeydown={(e) =>
+                                        handleDropdownKey(
+                                            e,
+                                            "settings-mic-source",
+                                            audioInputOptions,
+                                            settings.audio_microphone_source || "default_input",
+                                            (value) => updateAudioSetting("audio_microphone_source", value),
+                                        )}
+                                >
+                                    <span>{audioInputDevicesLoading
+                                        ? "scanning..."
+                                        : selectedLabel(audioInputOptions, settings.audio_microphone_source || "default_input")}</span>
+                                    <span class="terminal-caret">▾</span>
+                                </button>
+                                {#if openDropdown === "settings-mic-source"}
+                                    <div class="terminal-menu" role="listbox">
+                                        {#each audioInputOptions as option}
+                                            <button
+                                                type="button"
+                                                class:sel={(settings.audio_microphone_source || "default_input") === option.value}
+                                                role="option"
+                                                aria-selected={(settings.audio_microphone_source || "default_input") === option.value}
+                                                title={option.value}
+                                                onclick={() => {
+                                                    updateAudioSetting("audio_microphone_source", option.value);
+                                                    closeDropdown();
+                                                }}
+                                            >
+                                                <span class="terminal-check"
+                                                    >{(settings.audio_microphone_source || "default_input") === option.value
+                                                        ? ">"
+                                                        : ""}</span
+                                                >
+                                                {option.label}
+                                            </button>
+                                        {/each}
+                                    </div>
+                                {/if}
+                            </div>
                         </div>
                         <div class="cfg">
                             <label>audio_source</label><input
@@ -1184,13 +2288,7 @@
                                                         "--bg-opacity",
                                                         v,
                                                     );
-                                                    invoke(
-                                                        "set_window_opacity",
-                                                        {
-                                                            opacity:
-                                                                parseFloat(v),
-                                                        },
-                                                    );
+                                                    void applyWindowOpacity(v);
                                                 }}
                                             />
                                             <span class="slider-val"
@@ -1319,8 +2417,7 @@
                                     >
                                 </p>
                                 <p class="cfg-hint">
-                                    → changes apply live — export to save
-                                    permanently
+                                    → changes apply live and persist on restart
                                 </p>
                             </div>
                         {/if}
@@ -1386,6 +2483,96 @@
         -webkit-backdrop-filter: blur(var(--blur-radius, 0px));
     }
 
+    /* ─── Boot Screen ────────────────────────────────────────────────── */
+
+    .boot-screen {
+        position: fixed;
+        inset: 0;
+        z-index: 2000;
+        background: var(--bg-deepest, #080c12);
+        color: var(--text-dim, #7a8899);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        font-family: var(
+            --font-mono,
+            "JetBrains Mono",
+            "Fira Code",
+            "Cascadia Code",
+            "IBM Plex Mono",
+            ui-monospace,
+            monospace
+        );
+    }
+    .boot-terminal {
+        width: min(760px, 92vw);
+        min-height: min(380px, 70vh);
+        border: 1px solid var(--border-strong, #232a35);
+        background: var(--bg-base, #0a0e14);
+        padding: 14px;
+        display: flex;
+        flex-direction: column;
+    }
+    .boot-terminal-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid var(--border, #1a2030);
+        color: var(--text-faint, #364050);
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }
+    .boot-terminal-lines {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-end;
+        gap: 7px;
+        padding-top: 18px;
+        color: var(--text-dim, #7a8899);
+        font-size: clamp(11px, 1.7vw, 14px);
+        line-height: 1.45;
+        white-space: pre-wrap;
+    }
+    .boot-terminal-lines div:first-child {
+        color: var(--accent, #56b6c2);
+    }
+    .boot-cursor {
+        color: var(--accent, #56b6c2);
+        animation: boot-cursor 1s steps(1, end) infinite;
+    }
+    .boot-progress-label {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        margin-top: 18px;
+        margin-bottom: 8px;
+        font-size: 11px;
+        color: var(--text-muted, #4a5568);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }
+    .boot-bar {
+        height: 13px;
+        border: 1px solid var(--border-strong, #232a35);
+        background: var(--bg-deepest, #080c12);
+        padding: 2px;
+    }
+    .boot-bar-fill {
+        height: 100%;
+        background: var(--accent, #56b6c2);
+        transition: width 0.45s linear;
+    }
+    @keyframes boot-cursor {
+        50% {
+            opacity: 0;
+        }
+    }
     /* ─── Toast ───────────────────────────────────────────────────────── */
 
     .toast {
@@ -1426,6 +2613,154 @@
         to {
             opacity: 1;
             transform: translate(-50%, 0);
+        }
+    }
+
+    /* ─── Upload Queue ───────────────────────────────────────────────── */
+
+    .upload-dock {
+        position: fixed;
+        right: 14px;
+        bottom: 14px;
+        width: min(360px, calc(100vw - 28px));
+        background: var(--bg-deepest-t, var(--bg-deepest, #080c12));
+        border: 1px solid var(--border, #1a2030);
+        border-radius: 4px;
+        z-index: 950;
+        overflow: hidden;
+        box-shadow: 0 14px 42px rgba(0, 0, 0, 0.5);
+        backdrop-filter: blur(var(--blur-radius, 0px));
+        animation: upload-dock-in 0.18s ease-out;
+    }
+    .upload-dock.closed {
+        width: min(260px, calc(100vw - 28px));
+    }
+    .upload-dock-head {
+        width: 100%;
+        min-height: 34px;
+        padding: 8px 10px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        background: transparent;
+        border: none;
+        color: var(--text-dim, #7a8899);
+        font-family: inherit;
+        font-size: 11px;
+        cursor: pointer;
+        text-align: left;
+    }
+    .upload-dock-head:hover {
+        background: var(--bg-elev-1-t, var(--bg-elev-1, #111620));
+    }
+    .upload-dock-head > span:first-child {
+        color: var(--accent, #56b6c2);
+    }
+    .upload-dock-meta {
+        flex: 1;
+        color: var(--text-faint, #364050);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .upload-dock-toggle {
+        color: var(--text-muted, #4a5568);
+    }
+    .upload-queue {
+        border-top: 1px solid var(--border, #1a2030);
+        max-height: min(320px, calc(100vh - 96px));
+        overflow-y: auto;
+        padding: 6px;
+    }
+    .upload-item {
+        background: var(--bg-elev-1-t, var(--bg-elev-1, #111620));
+        border: 1px solid var(--border, #1a2030);
+        border-radius: 3px;
+        padding: 8px;
+    }
+    .upload-item + .upload-item {
+        margin-top: 6px;
+    }
+    .upload-item.failed {
+        border-color: var(--danger, #e06c75);
+    }
+    .upload-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    .upload-main {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+    }
+    .upload-name {
+        color: var(--text-dim, #7a8899);
+        font-size: 11px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .upload-sub {
+        color: var(--text-faint, #364050);
+        font-size: 10px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .upload-actions {
+        display: flex;
+        gap: 4px;
+        flex-shrink: 0;
+    }
+    .queue-btn,
+    .clear-uploads {
+        background: transparent;
+        border: 1px solid var(--border, #1a2030);
+        border-radius: 3px;
+        color: var(--text-muted, #4a5568);
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 10px;
+        padding: 2px 6px;
+        white-space: nowrap;
+    }
+    .queue-btn:hover,
+    .clear-uploads:hover {
+        border-color: var(--border-strong, #232a35);
+        color: var(--text-dim, #7a8899);
+    }
+    .upload-progress {
+        height: 3px;
+        margin-top: 7px;
+        border-radius: 999px;
+        background: var(--bg-deepest, #080c12);
+        overflow: hidden;
+    }
+    .upload-progress-fill {
+        height: 100%;
+        background: var(--accent, #56b6c2);
+        border-radius: inherit;
+        transition: width 0.25s ease;
+    }
+    .upload-item.failed .upload-progress-fill {
+        background: var(--danger, #e06c75);
+    }
+    .clear-uploads {
+        width: 100%;
+        margin-top: 6px;
+        padding: 5px 8px;
+    }
+    @keyframes upload-dock-in {
+        from {
+            opacity: 0;
+            transform: translateY(8px);
+        }
+        to {
+            opacity: 1;
+            transform: translateY(0);
         }
     }
 
@@ -1596,7 +2931,7 @@
     .sidenav button {
         display: flex;
         align-items: center;
-        justify-content: center;
+        justify-content: flex-start;
         gap: 8px;
         padding: 6px 10px;
         background: none;
@@ -1610,6 +2945,11 @@
         transition: all 0.1s;
         white-space: nowrap;
         overflow: hidden;
+        width: 100%;
+    }
+    .sidenav.collapsed button {
+        justify-content: center;
+        padding: 6px;
     }
     .sidenav button:hover {
         background: var(--bg-elev-1, #111620);
@@ -1684,7 +3024,125 @@
 
     .page-controls {
         display: flex;
+        align-items: center;
         gap: 2px;
+    }
+    .library-search,
+    .terminal-select-btn {
+        height: 26px;
+        background: var(--bg-elev-1-t, var(--bg-elev-1, #111620));
+        border: 1px solid var(--border, #1a2030);
+        color: var(--text-dim, #7a8899);
+        border-radius: 3px;
+        font-size: 11px;
+        font-family: inherit;
+        outline: none;
+    }
+    .library-search {
+        appearance: none;
+        -webkit-appearance: none;
+    }
+    .library-search {
+        width: 150px;
+        padding: 0 8px;
+    }
+    .library-search::placeholder {
+        color: var(--text-faint, #364050);
+    }
+    .terminal-select {
+        position: relative;
+        min-width: 90px;
+    }
+    .terminal-select-btn {
+        width: 100%;
+        min-width: 90px;
+        padding: 0 8px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        text-align: left;
+    }
+    .terminal-caret {
+        color: var(--text-faint, #364050);
+        font-size: 10px;
+    }
+    .library-search:focus,
+    .terminal-select.open .terminal-select-btn,
+    .terminal-select-btn:focus {
+        border-color: var(--accent, #56b6c2);
+        color: var(--text, #b8c4d0);
+    }
+    .terminal-menu {
+        position: absolute;
+        z-index: 80;
+        top: calc(100% + 4px);
+        left: 0;
+        min-width: 100%;
+        background: var(--bg-deepest-t, var(--bg-deepest, #080c12));
+        border: 1px solid var(--border-strong, #232a35);
+        border-radius: 3px;
+        padding: 4px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+        backdrop-filter: blur(var(--blur-radius, 0px));
+    }
+    .terminal-menu button {
+        width: 100%;
+        min-height: 24px;
+        padding: 3px 8px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        background: transparent;
+        border: none;
+        border-radius: 2px;
+        color: var(--text-muted, #4a5568);
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 11px;
+        text-align: left;
+        white-space: nowrap;
+    }
+    .terminal-menu button:hover,
+    .terminal-menu button.sel {
+        background: rgba(86, 182, 194, 0.08);
+        color: var(--accent, #56b6c2);
+    }
+    .terminal-check {
+        width: 8px;
+        color: var(--accent, #56b6c2);
+        flex-shrink: 0;
+    }
+    .terminal-toggle {
+        min-width: 58px;
+        height: 26px;
+        padding: 0 9px;
+        background: var(--bg-base, #0a0e14);
+        border: 1px solid var(--border, #1a2030);
+        border-radius: 3px;
+        color: var(--text-faint, #364050);
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 11px;
+        text-align: center;
+        text-transform: uppercase;
+    }
+    .terminal-toggle.on {
+        border-color: var(--accent, #56b6c2);
+        color: var(--accent, #56b6c2);
+        background: rgba(86, 182, 194, 0.07);
+    }
+    .terminal-toggle:hover {
+        border-color: var(--border-strong, #232a35);
+        color: var(--text-dim, #7a8899);
+    }
+    .terminal-toggle.on:hover {
+        border-color: var(--accent, #56b6c2);
+        color: var(--accent, #56b6c2);
+    }
+    .cfg-select {
+        width: 100%;
     }
     .view-toggle {
         width: 26px;
@@ -1765,6 +3223,10 @@
     .clip-card:hover {
         border-color: var(--border-strong, #232a35);
     }
+    .clip-card.fav {
+        border-color: var(--accent, #56b6c2);
+        box-shadow: inset 0 0 0 1px rgba(86, 182, 194, 0.18);
+    }
 
     .clip-thumb {
         position: relative;
@@ -1842,6 +3304,7 @@
         display: flex;
         gap: 3px;
         padding: 4px 8px 8px;
+        flex-wrap: wrap;
     }
 
     /* ─── List View ───────────────────────────────────────────────────── */
@@ -1866,6 +3329,10 @@
     }
     .list-row:hover {
         border-color: var(--border-strong, #232a35);
+    }
+    .list-row.fav {
+        border-color: var(--accent, #56b6c2);
+        box-shadow: inset 0 0 0 1px rgba(86, 182, 194, 0.14);
     }
 
     .list-thumb {
@@ -1952,6 +3419,11 @@
     .act-sec:hover {
         border-color: var(--border-strong, #232a35);
         color: var(--text-dim, #7a8899);
+    }
+    .act-sec.pin.on {
+        color: var(--accent, #56b6c2);
+        border-color: var(--accent, #56b6c2);
+        background: rgba(86, 182, 194, 0.06);
     }
     .act-sec:disabled {
         opacity: 0.3;
@@ -2056,6 +3528,42 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+    }
+
+    .audio-track-strip {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: wrap;
+    }
+    .audio-track-toggle {
+        height: 26px;
+        padding: 0 9px;
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        background: var(--bg-elev-1, #111620);
+        border: 1px solid var(--border, #1a2030);
+        border-radius: 3px;
+        color: var(--text-dim, #7a8899);
+        font-family: inherit;
+        font-size: 11px;
+        cursor: pointer;
+        text-transform: lowercase;
+    }
+    .audio-track-toggle span {
+        color: var(--accent, #56b6c2);
+        font-size: 10px;
+        text-transform: uppercase;
+    }
+    .audio-track-toggle.muted {
+        color: var(--text-faint, #364050);
+    }
+    .audio-track-toggle.muted span {
+        color: var(--danger, #e06c75);
+    }
+    .audio-track-toggle.mixed {
+        border-style: dashed;
     }
 
     .video-wrap {
@@ -2216,13 +3724,13 @@
         border-bottom: none;
     }
 
-    .cfg label {
+    .cfg label,
+    .cfg-label {
         font-size: 12px;
         color: var(--text-muted, #4a5568);
     }
 
-    .cfg input,
-    .cfg select {
+    .cfg input {
         width: 220px;
         padding: 4px 8px;
         background: var(--bg-base, #0a0e14);
@@ -2236,9 +3744,17 @@
         -webkit-appearance: none;
         appearance: none;
     }
-    .cfg input:focus,
-    .cfg select:focus {
+    .cfg input:focus {
         border-color: var(--accent, #56b6c2);
+    }
+    .cfg input[type="number"] {
+        appearance: textfield;
+        -moz-appearance: textfield;
+    }
+    .cfg input[type="number"]::-webkit-outer-spin-button,
+    .cfg input[type="number"]::-webkit-inner-spin-button {
+        -webkit-appearance: none;
+        margin: 0;
     }
 
     .cfg-suffix {

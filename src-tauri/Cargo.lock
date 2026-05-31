@@ -2982,7 +2982,7 @@ dependencies = [
 
 [[package]]
 name = "klyppd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aws-config",
  "aws-credential-types",

@@ -82,6 +82,9 @@ function createThemeStore() {
     apply() {
       applyToDOM(get({ subscribe }));
     },
+    current(): ThemeVars {
+      return get({ subscribe });
+    },
     reset() {
       const d = { ...defaultTheme };
       set(d);

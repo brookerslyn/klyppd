@@ -90,7 +90,7 @@ Klyppd acts as a frontend for `gpu-screen-recorder` while layering on:
 - Trimming tools
 - Custom workflows
 
-Hotkey integrations communicate with the running app through a Unix socket (`/tmp/klyppd.sock`), so triggers always read live from the app's settings — no shell scripts to keep in sync.
+Hotkey integrations communicate with the running app through a Unix socket under the user runtime directory (`$XDG_RUNTIME_DIR/klyppd/klyppd.sock`, with a temp fallback), so triggers always read live from the app's settings — no shell scripts to keep in sync.
 
 ---
 
@@ -221,7 +221,7 @@ Hotkeys work even when a fullscreen game has focus.
 
 #### Fallback: compositor keybinds (optional)
 
-If you prefer not to use the `input` group, you can bind through your compositor instead. These talk to the running app via a Unix socket (`/tmp/klyppd.sock`):
+If you prefer not to use the `input` group, you can bind through your compositor instead. These talk to the running app via the same Unix socket:
 
 ```ini
 # hyprland.conf
@@ -241,7 +241,7 @@ KDE / GNOME / other compositors: use any keybind manager that can run a shell co
 
 ### Theming
 
-Drop a `~/.config/klyppd/theme.css` file to override any of the CSS variables:
+Drop a `~/.config/klyppd/theme.css` file to override any of the CSS variables. The app also honors the `theme_path` setting if you want to point at another file:
 
 ```css
 :root {

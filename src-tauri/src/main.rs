@@ -2,8 +2,7 @@
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-
-const SOCKET: &str = "/tmp/klyppd.sock";
+use std::path::PathBuf;
 
 fn main() {
     // Workarounds for webkit2gtk on Wayland — discovered through painful trial and error.
@@ -22,6 +21,28 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let [_, flag, cmd, ..] = args.as_slice() {
         if flag == "--cmd" {
+            if cmd == "purge-non-temp-r2" {
+                match klyppd_lib::purge_non_temp_r2() {
+                    Ok((deleted, failed)) => {
+                        eprintln!("purge-non-temp-r2: deleted={deleted} failed={failed}");
+                    }
+                    Err(e) => {
+                        eprintln!("purge-non-temp-r2 failed: {e}");
+                    }
+                }
+                return;
+            }
+            if cmd == "purge-orphan-temp-r2" {
+                match klyppd_lib::purge_orphan_temp_r2() {
+                    Ok((deleted, failed)) => {
+                        eprintln!("purge-orphan-temp-r2: deleted={deleted} failed={failed}");
+                    }
+                    Err(e) => {
+                        eprintln!("purge-orphan-temp-r2 failed: {e}");
+                    }
+                }
+                return;
+            }
             send(cmd);
             return;
         }
@@ -30,11 +51,19 @@ fn main() {
 }
 
 fn send(cmd: &str) {
-    if let Ok(mut stream) = UnixStream::connect(SOCKET) {
+    if let Ok(mut stream) = UnixStream::connect(socket_path()) {
         let _ = stream.write_all(cmd.as_bytes());
     } else {
         let _ = std::process::Command::new("notify-send")
             .args(["-a", "klyppd", "-u", "low", "-t", "1500", "klyppd", "App not running"])
             .status();
     }
+}
+
+fn socket_path() -> PathBuf {
+    dirs::runtime_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("klyppd")
+        .join("klyppd.sock")
 }
