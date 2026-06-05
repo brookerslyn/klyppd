@@ -265,9 +265,7 @@ Drop a `~/.config/klyppd/theme.css` file to override any of the CSS variables. T
 
 Klyppd is under **active development**.
 
-The current UI was heavily built with the help of AI-assisted tools to accelerate development as a solo project, so some parts of the interface may still feel experimental or inconsistent. The current focus is **performance, workflow, and functionality first** — UI polish and redesigns will continue over time.
-
----
+If you wish to help with the development of Klyppd you can contribute and help with the following:
 
 ## Roadmap
 
