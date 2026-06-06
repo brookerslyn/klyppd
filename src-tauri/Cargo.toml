@@ -1,6 +1,6 @@
 [package]
 name = "klyppd"
-version = "0.2.1"
+version = "0.3.1"
 description = "Medal-style clip manager for Linux/Wayland — gpu-screen-recorder + Cloudflare R2."
 authors = ["brook"]
 edition = "2021"
@@ -34,6 +34,7 @@ libc = "0.2"
 evdev = "0.12"
 urlencoding = "2"
 base64 = "0.22"
+filetime = "0.2"
 
 # Faster dev builds: skip most debug info, optimize dependencies even in dev
 [profile.dev]

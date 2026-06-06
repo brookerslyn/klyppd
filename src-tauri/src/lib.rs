@@ -7,6 +7,7 @@ mod settings;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration as StdDuration, SystemTime};
 
 use base64::Engine;
 use chrono::{Duration, Local, Utc};
@@ -21,8 +22,8 @@ use settings::AppSettings;
 const PENDING_NAME_PATH: &str = "/tmp/klyppd-pending-name";
 const PENDING_AUDIO_TRACKS_PATH: &str = "/tmp/klyppd-pending-audio-tracks";
 const PREVIEW_DIR: &str = "klyppd-preview";
-
-// TODO: configurable preview cache limit (currently grows unbounded)
+const PREVIEW_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const PREVIEW_CACHE_MAX_AGE: StdDuration = StdDuration::from_secs(7 * 24 * 60 * 60);
 
 pub struct AppState {
     pub db: Mutex<Database>,
@@ -167,12 +168,14 @@ async fn transcode_for_preview(input: String, enabled_audio_tracks: Option<Vec<u
         && has_aac_audio(&input)
         && editor::audio_stream_count(&input) <= 1
     {
+        prune_preview_cache(None).ok();
         return Ok(input);
     }
 
-    let dir = std::env::temp_dir().join(PREVIEW_DIR);
+    let dir = preview_cache_dir();
     std::fs::create_dir_all(&dir).map_err(err)?;
-    let stem = Path::new(&input).file_stem().unwrap_or_default().to_string_lossy();
+    prune_preview_cache(None).ok();
+    let cache_name = settings::preview_cache_name(&input);
     let track_key = enabled_audio_tracks
         .as_ref()
         .map(|tracks| {
@@ -183,8 +186,9 @@ async fn transcode_for_preview(input: String, enabled_audio_tracks: Option<Vec<u
             }
         })
         .unwrap_or_else(|| "all".into());
-    let out = dir.join(format!("{stem}-{track_key}.mp4"));
+    let out = dir.join(format!("{cache_name}-{track_key}.mp4"));
     if out.exists() {
+        touch_preview_cache_file(&out).ok();
         return Ok(out.to_string_lossy().into());
     }
 
@@ -193,7 +197,9 @@ async fn transcode_for_preview(input: String, enabled_audio_tracks: Option<Vec<u
         &out.to_string_lossy(),
         enabled_audio_tracks.as_deref(),
     )
-    .map_err(err)
+    .map_err(err)?;
+    prune_preview_cache(Some(&out)).ok();
+    Ok(out.to_string_lossy().into())
 }
 
 fn has_aac_audio(path: &str) -> bool {
@@ -202,6 +208,94 @@ fn has_aac_audio(path: &str) -> bool {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "aac")
         .unwrap_or(false)
+}
+
+#[derive(Debug)]
+struct PreviewCacheEntry {
+    path: PathBuf,
+    size: u64,
+    modified: SystemTime,
+}
+
+fn preview_cache_dir() -> PathBuf {
+    std::env::temp_dir().join(PREVIEW_DIR)
+}
+
+fn touch_preview_cache_file(path: &Path) -> Result<(), String> {
+    filetime::set_file_mtime(path, filetime::FileTime::now()).map_err(err)
+}
+
+fn prune_preview_cache(protected: Option<&Path>) -> Result<(), String> {
+    let dir = preview_cache_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(());
+    };
+
+    let protected = protected.and_then(|path| path.canonicalize().ok());
+    let now = SystemTime::now();
+    let mut cache_entries = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("mp4") {
+            continue;
+        }
+
+        let is_protected = protected.as_ref().is_some_and(|protected| {
+            path.canonicalize()
+                .map(|candidate| candidate == *protected)
+                .unwrap_or(false)
+        });
+
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let stale = now
+            .duration_since(modified)
+            .map(|age| age > PREVIEW_CACHE_MAX_AGE)
+            .unwrap_or(false);
+
+        if stale && !is_protected {
+            std::fs::remove_file(&path).ok();
+            continue;
+        }
+
+        cache_entries.push(PreviewCacheEntry {
+            path,
+            size: metadata.len(),
+            modified,
+        });
+    }
+
+    let mut total: u64 = cache_entries.iter().map(|entry| entry.size).sum();
+    if total <= PREVIEW_CACHE_MAX_BYTES {
+        return Ok(());
+    }
+
+    cache_entries.sort_by_key(|entry| entry.modified);
+    for entry in cache_entries {
+        if total <= PREVIEW_CACHE_MAX_BYTES {
+            break;
+        }
+
+        let is_protected = protected.as_ref().is_some_and(|protected| {
+            entry
+                .path
+                .canonicalize()
+                .map(|candidate| candidate == *protected)
+                .unwrap_or(false)
+        });
+        if is_protected {
+            continue;
+        }
+
+        if std::fs::remove_file(&entry.path).is_ok() {
+            total = total.saturating_sub(entry.size);
+        }
+    }
+
+    Ok(())
 }
 
 // R2 -------------------------------------------------------------------------
@@ -397,66 +491,106 @@ fn read_thumbnail(path: String) -> Result<String, String> {
     Ok(format!("data:image/jpeg;base64,{b64}"))
 }
 
-#[tauri::command]
-fn read_video_bytes(path: String) -> Result<Vec<u8>, String> {
-    std::fs::read(&path).map_err(err)
-}
-
 /// Serve a video file on a random localhost port, return the URL.
 #[tauri::command]
 fn serve_video(path: String) -> Result<String, String> {
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::net::TcpListener;
+
+    let total = std::fs::metadata(&path).map_err(err)?.len();
+    if total == 0 {
+        return Err("video file is empty".into());
+    }
 
     let listener = TcpListener::bind("127.0.0.1:0").map_err(err)?;
     let port = listener.local_addr().map_err(err)?.port();
     let url = format!("http://127.0.0.1:{port}/video.mp4");
 
     std::thread::spawn(move || {
-        // Serve exactly one request then exit
-        let file_data = match std::fs::read(&path) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        // Accept up to 5 requests (initial + range requests for seeking)
-        for _ in 0..20 {
+        // Accept enough requests for metadata probes, playback, and seek ranges.
+        for _ in 0..64 {
             let Ok((mut stream, _)) = listener.accept() else { break; };
             let mut req = vec![0u8; 4096];
             let n = stream.read(&mut req).unwrap_or(0);
             let req_str = String::from_utf8_lossy(&req[..n]);
+            let method = req_str.split_whitespace().next().unwrap_or("GET");
 
-            // Parse Range header
-            let (start, end) = if let Some(range_line) = req_str.lines().find(|l| l.starts_with("Range:")) {
-                // Range: bytes=START-END
-                let range = range_line.trim_start_matches("Range: bytes=");
-                let parts: Vec<&str> = range.split('-').collect();
-                let s: usize = parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
-                let e: usize = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(file_data.len() - 1);
-                (s, e.min(file_data.len() - 1))
-            } else {
-                (0, file_data.len() - 1)
+            if !matches!(method, "GET" | "HEAD") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n",
+                );
+                continue;
+            }
+
+            let Some((start, end)) = parse_range_header(&req_str, total) else {
+                let header = format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\n\r\n"
+                );
+                let _ = stream.write_all(header.as_bytes());
+                continue;
             };
 
-            let chunk = &file_data[start..=end];
-            let total = file_data.len();
+            let length = end - start + 1;
+            let partial = start != 0 || end != total - 1;
 
-            let header = if start == 0 && end == total - 1 {
+            let header = if partial {
+                format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {length}\r\nAccess-Control-Allow-Origin: *\r\nAccept-Ranges: bytes\r\n\r\n"
+                )
+            } else {
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {total}\r\nAccess-Control-Allow-Origin: *\r\nAccept-Ranges: bytes\r\n\r\n"
                 )
-            } else {
-                format!(
-                    "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccept-Ranges: bytes\r\n\r\n",
-                    chunk.len()
-                )
             };
 
-            stream.write_all(header.as_bytes()).ok();
-            stream.write_all(chunk).ok();
+            if stream.write_all(header.as_bytes()).is_err() || method == "HEAD" {
+                continue;
+            }
+
+            let Ok(mut file) = std::fs::File::open(&path) else { continue; };
+            if file.seek(SeekFrom::Start(start)).is_err() {
+                continue;
+            }
+            std::io::copy(&mut file.take(length), &mut stream).ok();
         }
     });
 
     Ok(url)
+}
+
+fn parse_range_header(req: &str, total: u64) -> Option<(u64, u64)> {
+    let Some(range_line) = req.lines().find(|line| line.starts_with("Range:")) else {
+        return Some((0, total - 1));
+    };
+    let range = range_line.trim_start_matches("Range:").trim();
+    let range = range.strip_prefix("bytes=")?;
+    let (start, end) = range.split_once('-')?;
+
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        let start = total.saturating_sub(suffix);
+        return Some((start, total - 1));
+    }
+
+    let start = start.parse::<u64>().ok()?;
+    if start >= total {
+        return None;
+    }
+
+    let end = if end.is_empty() {
+        total - 1
+    } else {
+        end.parse::<u64>().ok()?.min(total - 1)
+    };
+
+    if end < start {
+        return None;
+    }
+
+    Some((start, end))
 }
 
 #[tauri::command]
@@ -820,14 +954,6 @@ fn spawn_evdev_hotkeys(handle: tauri::AppHandle) {
     });
 }
 
-fn key_matches(hotkey_str: &str, pressed: evdev::Key) -> bool {
-    // Parse "Alt+R" or "Ctrl+Shift+F9" or just "F9"
-    let parts: Vec<&str> = hotkey_str.split('+').map(|s| s.trim()).collect();
-    let main_key = parts.last().unwrap_or(&"");
-    let key_name = format!("KEY_{}", main_key.to_uppercase());
-    format!("{:?}", pressed) == key_name
-}
-
 /// Track modifier state globally for combo hotkeys
 static MODS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 const MOD_ALT: u8 = 1;
@@ -1076,7 +1202,7 @@ pub fn run() {
             upload_clip, delete_from_r2, r2_storage,
             get_settings, save_settings, set_window_opacity, get_storage_usage, get_theme_css,
             save_theme_css, list_audio_input_devices,
-            scan_clips, read_thumbnail, read_video_bytes, serve_video, replace_file,
+            scan_clips, read_thumbnail, serve_video, replace_file,
         ])
         .run(tauri::generate_context!())
         .expect("run tauri app");

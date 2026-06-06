@@ -209,15 +209,16 @@
         ":: preparing library index",
         ":: handing off to loader",
     ];
+    const minimumBootMs = 900;
+    const bootLineDelayMs = 80;
 
     // ─── Lifecycle ─────────────────────────────────────────────────────────
 
     onMount(async () => {
         const bootStart = performance.now();
+        const terminalTask = playBootTerminal();
 
         try {
-            await playBootTerminal();
-
             await bootStep(12, async () => {
                 await injectUserTheme();
                 theme.apply();
@@ -251,9 +252,12 @@
             notify("Startup failed", "err");
         } finally {
             setInterval(refresh, 3000);
-            await holdBoot(bootStart, 4300);
+            await Promise.allSettled([
+                terminalTask,
+                holdBoot(bootStart, minimumBootMs),
+            ]);
             bootProgress = 100;
-            await sleep(450);
+            await sleep(120);
             bootPhase = "ready";
             forceRepaint();
         }
@@ -263,16 +267,14 @@
         bootTerminalLines = [];
         for (const line of bootTerminalScript) {
             bootTerminalLines = [...bootTerminalLines, line];
-            await sleep(320);
+            await sleep(bootLineDelayMs);
         }
-        await sleep(420);
+        await sleep(120);
     }
 
     async function bootStep(progress: number, task: () => Promise<void>) {
         bootProgress = Math.max(bootProgress, progress - 8);
-        await sleep(260);
         await task();
-        await sleep(140);
         bootProgress = Math.max(bootProgress, progress);
     }
 

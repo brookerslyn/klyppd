@@ -135,12 +135,12 @@ npm install
 npm run tauri build -- --bundles deb
 ```
 
-This produces a `.deb` at `src-tauri/target/release/bundle/deb/klyppd_0.1.0_amd64.deb`.
+This produces a `.deb` at `src-tauri/target/release/bundle/deb/klyppd_0.3.1_amd64.deb`.
 
 #### Install on Debian / Ubuntu
 
 ```bash
-sudo dpkg -i src-tauri/target/release/bundle/deb/klyppd_0.1.0_amd64.deb
+sudo dpkg -i src-tauri/target/release/bundle/deb/klyppd_0.3.1_amd64.deb
 sudo apt -f install
 ```
 

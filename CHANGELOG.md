@@ -1,4 +1,19 @@
-# Session Changelog
+# Changelog
+
+## 0.3.1 - 2026-06-06
+
+### Performance
+
+- Stream editor preview video from disk with HTTP range support instead of loading entire clips into memory.
+- Cap and prune generated preview transcodes in `/tmp/klyppd-preview`.
+- Reduce startup latency by making the boot animation non-blocking.
+
+### Fixes
+
+- Remove the unused full-video byte read command from the Tauri API.
+- Remove stale hotkey parser dead code.
+
+## Session Changelog
 
 ## UI
 
@@ -27,4 +42,3 @@
 - Fixed the library filters so uploads and permanent tabs use the same filtered data.
 - Fixed the filter UI layout so controls fit the terminal theme.
 - Fixed the dropdown popup styling so open menus match the rest of the app.
-
