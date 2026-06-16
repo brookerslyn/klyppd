@@ -880,6 +880,16 @@
         updateAudioSetting(key, value);
     }
 
+    async function previewClippingSound() {
+        try {
+            await invoke("save_settings", { newSettings: settings });
+            await invoke("play_clip_sound");
+        } catch (e) {
+            console.error(e);
+            notify(String(e), "err");
+        }
+    }
+
     // ─── Theme ─────────────────────────────────────────────────────────────
 
     function setThemeVar(key: keyof ThemeVars, value: string) {
@@ -2186,6 +2196,40 @@
                             <label>audio_source</label><input
                                 bind:value={settings.audio_source}
                             />
+                        </div>
+                        <div class="cfg">
+                            <span class="cfg-label">clip_sound</span>
+                            <button
+                                type="button"
+                                class="terminal-toggle"
+                                class:on={settings.clipping_sound_enabled ?? true}
+                                aria-pressed={settings.clipping_sound_enabled ?? true}
+                                onclick={() =>
+                                    updateAudioToggle(
+                                        "clipping_sound_enabled",
+                                        !(settings.clipping_sound_enabled ?? true),
+                                    )}
+                            >
+                                <span>{settings.clipping_sound_enabled ?? true
+                                    ? "on"
+                                    : "off"}</span>
+                            </button>
+                        </div>
+                        <div class="cfg">
+                            <label for="clip-sound-path">clip_sound_path</label>
+                            <div class="cfg-sound">
+                                <input
+                                    id="clip-sound-path"
+                                    bind:value={settings.clipping_sound_path}
+                                    placeholder="built-in chime"
+                                />
+                                <button
+                                    type="button"
+                                    class="act-sec"
+                                    onclick={previewClippingSound}
+                                    title="Preview clipping sound">▶</button
+                                >
+                            </div>
                         </div>
                     </section>
                     <section class="cfg-section">
@@ -3770,6 +3814,21 @@
     .cfg-suffix span {
         font-size: 10px;
         color: var(--text-faint, #364050);
+    }
+    .cfg-sound {
+        width: 220px;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 28px;
+        gap: 5px;
+    }
+    .cfg-sound input {
+        width: 100%;
+        min-width: 0;
+    }
+    .cfg-sound .act-sec {
+        width: 28px;
+        height: 26px;
+        padding: 0;
     }
 
     .cfg-hint {

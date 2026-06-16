@@ -6,6 +6,7 @@ mod settings;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration as StdDuration, SystemTime};
 
@@ -352,6 +353,12 @@ fn set_window_opacity(opacity: f64) -> Result<(), String> {
 fn save_settings(state: tauri::State<AppState>, new_settings: AppSettings) -> Result<(), String> {
     *state.settings.lock().unwrap() = new_settings.clone();
     settings::save(&new_settings).map_err(err)
+}
+
+#[tauri::command]
+fn play_clip_sound(state: tauri::State<AppState>) -> Result<(), String> {
+    let settings = state.settings.lock().unwrap().clone();
+    play_clipping_sound(&settings)
 }
 
 #[tauri::command]
@@ -767,6 +774,91 @@ fn notify_desktop(title: &str, body: &str) {
         .status();
 }
 
+fn play_clipping_sound(settings: &AppSettings) -> Result<(), String> {
+    let path = if settings.clipping_sound_path.trim().is_empty() {
+        builtin_clipping_sound_path()?
+    } else {
+        settings::resolve_user_path(settings.clipping_sound_path.trim())
+    };
+
+    if !path.is_file() {
+        return Err(format!("Clipping sound not found: {}", path.display()));
+    }
+
+    for player in ["pw-play", "paplay", "aplay"] {
+        if std::process::Command::new(player)
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+
+    Err("No supported audio player found (pw-play, paplay, or aplay)".into())
+}
+
+fn builtin_clipping_sound_path() -> Result<PathBuf, String> {
+    let path = dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("klyppd")
+        .join("clip-saved.wav");
+    if path.is_file() {
+        return Ok(path);
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(err)?;
+    }
+    std::fs::write(&path, synthesize_clipping_sound()).map_err(err)?;
+    Ok(path)
+}
+
+fn synthesize_clipping_sound() -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 48_000;
+    const DURATION: f32 = 0.34;
+    let sample_count = (SAMPLE_RATE as f32 * DURATION) as u32;
+    let data_size = sample_count * 2;
+    let mut wav = Vec::with_capacity(44 + data_size as usize);
+
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+
+    for index in 0..sample_count {
+        let t = index as f32 / SAMPLE_RATE as f32;
+        let first = chime_note(t, 0.0, 740.0, 0.19);
+        let second = chime_note(t, 0.085, 1110.0, 0.24);
+        let sample = ((first + second) * 0.28).clamp(-1.0, 1.0);
+        wav.extend_from_slice(&((sample * i16::MAX as f32) as i16).to_le_bytes());
+    }
+    wav
+}
+
+fn chime_note(t: f32, start: f32, frequency: f32, length: f32) -> f32 {
+    let local = t - start;
+    if !(0.0..length).contains(&local) {
+        return 0.0;
+    }
+    let attack = (local / 0.008).min(1.0);
+    let decay = (1.0 - local / length).powf(2.2);
+    let fundamental = (std::f32::consts::TAU * frequency * local).sin();
+    let overtone = (std::f32::consts::TAU * frequency * 2.0 * local).sin() * 0.18;
+    (fundamental + overtone) * attack * decay
+}
+
 fn toast<R: tauri::Runtime>(handle: &tauri::AppHandle<R>, msg: &str, kind: &str) {
     let _ = handle.emit("toast", json!({ "msg": msg, "kind": kind }));
 }
@@ -793,6 +885,9 @@ fn handle_hotkey(handle: &tauri::AppHandle, cmd: &str) {
 
             match recorder.save_replay() {
                 Ok(_) => {
+                    if settings.clipping_sound_enabled {
+                        play_clipping_sound(&settings).ok();
+                    }
                     let body = format!("Klyppd the last {}s of {}", settings.buffer_seconds, win);
                     toast(handle, &body, "ok");
                     notify_desktop("Klypp saved", &body);
@@ -1201,7 +1296,7 @@ pub fn run() {
             get_clip_audio_tracks,
             upload_clip, delete_from_r2, r2_storage,
             get_settings, save_settings, set_window_opacity, get_storage_usage, get_theme_css,
-            save_theme_css, list_audio_input_devices,
+            save_theme_css, list_audio_input_devices, play_clip_sound,
             scan_clips, read_thumbnail, serve_video, replace_file,
         ])
         .run(tauri::generate_context!())

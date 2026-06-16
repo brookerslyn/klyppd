@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.2 - 2026-06-16
+
+### Features
+
+- Added configurable clipping sounds with a built-in chime, custom WAV path, and preview control.
+
+### Fixes
+
+- Fixed replay saves falsely reporting success after the recorder process exited.
+- Added a Hyprland monitor capture fallback when the desktop portal is unavailable.
+- Kept recorder state in sync when replay or recording children exit unexpectedly.
+
 ## 0.3.1 - 2026-06-06
 
 ### Performance

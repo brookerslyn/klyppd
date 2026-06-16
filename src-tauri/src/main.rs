@@ -10,9 +10,11 @@ fn main() {
     // GTK overlay scrollbar is hideous and unstyleable from CSS.
     // Adwaita:dark gives us slightly less ugly fallback widgets.
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1"); }
+        unsafe {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
     }
-    // Kill GTK scrollbar entirely — we use mousewheel/trackpad only
+    // Kill GTK scrollbar entirely — we use mousewheel/trackpad only (cuz theming it is hard af)
     unsafe {
         std::env::set_var("GTK_OVERLAY_SCROLLING", "0");
         std::env::set_var("GTK_THEME", "Adwaita:dark");
@@ -55,7 +57,16 @@ fn send(cmd: &str) {
         let _ = stream.write_all(cmd.as_bytes());
     } else {
         let _ = std::process::Command::new("notify-send")
-            .args(["-a", "klyppd", "-u", "low", "-t", "1500", "klyppd", "App not running"])
+            .args([
+                "-a",
+                "klyppd",
+                "-u",
+                "low",
+                "-t",
+                "1500",
+                "klyppd",
+                "App not running",
+            ])
             .status();
     }
 }

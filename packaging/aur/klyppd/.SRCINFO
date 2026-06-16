@@ -1,10 +1,15 @@
-pkgbase = klyppd-bin
+pkgbase = klyppd
 	pkgdesc = Performance-first Linux clipping app with instant replay, trimming, and cloud uploads.
 	pkgver = 0.3.2
 	pkgrel = 1
 	url = https://github.com/brookerslyn/klyppd
 	arch = x86_64
 	license = MIT
+	makedepends = rust
+	makedepends = cargo
+	makedepends = nodejs
+	makedepends = npm
+	makedepends = pkgconf
 	depends = gpu-screen-recorder
 	depends = ffmpeg
 	depends = webkit2gtk-4.1
@@ -13,10 +18,8 @@ pkgbase = klyppd-bin
 	depends = gst-plugins-bad
 	depends = gst-libav
 	optdepends = libnotify: desktop notifications for clip events
-	provides = klyppd=0.3.2
-	conflicts = klyppd
-	noextract = klyppd-0.3.2.deb
-	source = klyppd-0.3.2.deb::https://github.com/brookerslyn/klyppd/releases/download/v0.3.2/klyppd_0.3.2_amd64.deb
+	optdepends = hyprland: tested compositor with first-class hotkey integration
+	source = klyppd-0.3.2.tar.gz::https://github.com/brookerslyn/klyppd/archive/refs/tags/v0.3.2.tar.gz
 	sha256sums = SKIP
 
-pkgname = klyppd-bin
+pkgname = klyppd

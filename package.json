@@ -1,6 +1,6 @@
 {
   "name": "klyppd",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Medal-style clip manager for Linux/Wayland — gpu-screen-recorder + Cloudflare R2.",
   "type": "module",
   "scripts": {
