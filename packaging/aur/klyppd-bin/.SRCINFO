@@ -17,6 +17,6 @@ pkgbase = klyppd-bin
 	conflicts = klyppd
 	noextract = klyppd-0.3.2.deb
 	source = klyppd-0.3.2.deb::https://github.com/brookerslyn/klyppd/releases/download/v0.3.2/klyppd_0.3.2_amd64.deb
-	sha256sums = SKIP
+	sha256sums = 2ac2b402fb35dbbe2d18b8dcf6840cc3504cdea7b67953a771ca637824625667
 
 pkgname = klyppd-bin

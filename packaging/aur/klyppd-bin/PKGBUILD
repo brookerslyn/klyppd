@@ -23,7 +23,7 @@ optdepends=(
 )
 source=("${_pkgname}-${pkgver}.deb::${url}/releases/download/v${pkgver}/${_pkgname}_${pkgver}_amd64.deb")
 noextract=("${_pkgname}-${pkgver}.deb")
-sha256sums=('SKIP')   # refresh with: updpkgsums
+sha256sums=('2ac2b402fb35dbbe2d18b8dcf6840cc3504cdea7b67953a771ca637824625667')
 
 package() {
     cd "$srcdir"
